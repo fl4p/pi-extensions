@@ -1,0 +1,15 @@
+{
+  "name": "pi-extensions",
+  "version": "0.1.0",
+  "description": "Personal pi coding-agent extensions",
+  "private": true,
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./extensions/persistent-history.ts"
+    ]
+  },
+  "keywords": ["pi", "pi-coding-agent", "extensions"],
+  "license": "MIT",
+  "author": "Fabian <fabian@schlieper.email>"
+}
