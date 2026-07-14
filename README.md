@@ -4,6 +4,24 @@ Personal extensions for [pi](https://github.com/earendil-works/pi-coding-agent),
 
 ## Extensions
 
+### block-web-search
+
+Removes `web_search` (the Gemini-synthesis provider) from the active tool set at `session_start`, forcing the agent to use `google_search` (raw Google blue links via Server) + `ctx_fetch_and_index` / `fetch_content` for primary sources instead.
+
+Motivation: `web_search` returns an AI-synthesized answer that averages sources of different ages and quality into one confident paragraph — fine for conceptual questions, bad for any quantitative work where provenance and freshness matter (it gave stale supply figures and a 2×-inflated treasury number this session). `google_search` gives raw links with snippets; you judge and fetch primaries.
+
+Hard block at the tool layer — the tool is removed before the agent sees it, so it can't be called. Equivalent to the CLI alias `pi -xt web_search` but permanent for every session that loads the extension.
+
+#### Install
+
+Symlink into pi's global extensions directory:
+
+```bash
+ln -s /Users/fab/dev/vibe/pi-extensions/extensions/block-web-search.ts ~/.pi/agent/extensions/block-web-search.ts
+```
+
+Then restart pi (or `/reload`).
+
 ### persistent-history
 
 Makes pi's `<up>`/`<down>` editor prompt history persist across sessions and restarts.
