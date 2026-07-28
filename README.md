@@ -52,6 +52,20 @@ Then restart pi (or run `/reload`).
 - Only acts in TUI mode (`ctx.mode === "tui"`).
 - Persists only on real keystroke-driven submissions, not on the initial session-restore rebuild, so resuming a session does not pollute the global history file with that session's messages.
 
+### turn-timer
+
+Shows how long the last agent turn took in the TUI status bar.
+
+Records a timestamp at `agent_start` and, at `agent_end`, renders the elapsed time (e.g. `⏱ 42.3s` or `⏱ 2m5s`) as a dim status entry. The status is cleared when the next turn starts.
+
+#### Install
+
+```bash
+ln -s /path/to/pi-extensions/extensions/turn-timer.ts ~/.pi/agent/extensions/turn-timer.ts
+```
+
+Then restart pi (or `/reload`).
+
 ## License
 
 MIT
