@@ -4,6 +4,32 @@ Personal extensions for [pi](https://github.com/earendil-works/pi-coding-agent),
 
 ## Extensions
 
+### bash-duration
+
+Overrides pi's built-in `bash` tool so timeout values require explicit units:
+
+```json
+{ "command": "python -m unittest", "timeout": "180s" }
+```
+
+Accepted units are `ms`, `s`, `m`, and `h`. Bare numbers are rejected, preventing confusion between tools that interpret numeric timeouts as seconds or milliseconds. Foreground commands are capped at one hour; use `bash_background` for longer jobs.
+
+#### Install
+
+Symlink into pi's global extensions directory:
+
+```bash
+ln -s /path/to/pi-extensions/extensions/bash-duration.ts ~/.pi/agent/extensions/bash-duration.ts
+```
+
+Or install the repo as a pi package. The extension is included in `package.json` and loads automatically:
+
+```bash
+pi install git:github.com/fl4p/pi-extensions
+```
+
+Then restart pi (or `/reload`).
+
 ### block-web-search
 
 Removes `web_search` (the Gemini-synthesis provider) from the active tool set at `session_start`, forcing the agent to use `google_search` (raw Google blue links via Serper) + `ctx_fetch_and_index` / `fetch_content` for primary sources instead.
