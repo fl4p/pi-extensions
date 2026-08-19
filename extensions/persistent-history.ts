@@ -15,14 +15,20 @@
  */
 
 import { CustomEditor, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 
-const HISTORY_FILE = path.join(os.homedir(), ".pi", "agent", "editor-history.json");
+export const HISTORY_FILE = path.join(os.homedir(), ".pi", "agent", "editor-history.json");
+const LOCK_DIR = `${HISTORY_FILE}.lock`;
 const MAX = 100;
+const LOCK_STALE_MS = 10_000;
+const LOCK_ATTEMPTS = 50;
+const LOCK_RETRY_MS = 10;
+const sleeper = new Int32Array(new SharedArrayBuffer(4));
 
-function loadHistory(): string[] {
+export function loadHistory(): string[] {
 	try {
 		const arr = JSON.parse(fs.readFileSync(HISTORY_FILE, "utf8"));
 		if (Array.isArray(arr)) {
@@ -32,10 +38,56 @@ function loadHistory(): string[] {
 	return [];
 }
 
-function saveHistory(history: string[]): void {
+function acquireLock(): () => void {
+	for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt++) {
+		try {
+			fs.mkdirSync(LOCK_DIR, { mode: 0o700 });
+			return () => fs.rmSync(LOCK_DIR, { recursive: true, force: true });
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			try {
+				if (Date.now() - fs.statSync(LOCK_DIR).mtimeMs > LOCK_STALE_MS) {
+					fs.rmSync(LOCK_DIR, { recursive: true, force: true });
+					continue;
+				}
+			} catch {}
+			Atomics.wait(sleeper, 0, 0, LOCK_RETRY_MS);
+		}
+	}
+	throw new Error("Timed out waiting for editor history lock");
+}
+
+function atomicWriteHistory(history: string[]): void {
+	const temp = `${HISTORY_FILE}.${process.pid}.${randomUUID()}.tmp`;
+	let fd: number | undefined;
 	try {
-		fs.mkdirSync(path.dirname(HISTORY_FILE), { recursive: true });
-		fs.writeFileSync(HISTORY_FILE, JSON.stringify(history.slice(0, MAX)));
+		fd = fs.openSync(temp, "wx", 0o600);
+		fs.writeFileSync(fd, JSON.stringify(history.slice(0, MAX)), "utf8");
+		fs.fsyncSync(fd);
+		fs.closeSync(fd);
+		fd = undefined;
+		fs.renameSync(temp, HISTORY_FILE);
+		fs.chmodSync(HISTORY_FILE, 0o600);
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
+		try {
+			fs.unlinkSync(temp);
+		} catch {}
+	}
+}
+
+export function saveHistory(history: string[]): void {
+	try {
+		fs.mkdirSync(path.dirname(HISTORY_FILE), { recursive: true, mode: 0o700 });
+		const release = acquireLock();
+		try {
+			const disk = loadHistory();
+			const latest = history[0] === undefined ? [] : [history[0]];
+			const merged = [...new Set([...latest, ...disk, ...history.slice(1)])].slice(0, MAX);
+			atomicWriteHistory(merged);
+		} finally {
+			release();
+		}
 	} catch {}
 }
 
@@ -48,22 +100,26 @@ export default function (pi: ExtensionAPI) {
 			const editor = previousFactory
 				? previousFactory(tui, theme, keybindings)
 				: new CustomEditor(tui, theme, keybindings);
+			const historyEditor = editor as unknown as {
+				history?: string[];
+				addToHistory?: (text: string) => void;
+				handleInput: (data: string) => void;
+			};
+			if (!Array.isArray(historyEditor.history) || typeof historyEditor.addToHistory !== "function") return editor;
 
-			if (editor.history.length === 0) {
-				editor.history = loadHistory();
-			}
+			if (historyEditor.history.length === 0) historyEditor.history = loadHistory();
 
 			// Persist only on real submissions, not on the initial
 			// renderSessionContext populateHistory rebuild. Arm on the
 			// first keystroke, which always follows that rebuild.
 			let persistEnabled = false;
-			const origAdd = editor.addToHistory.bind(editor);
-			editor.addToHistory = (text: string) => {
+			const origAdd = historyEditor.addToHistory.bind(editor);
+			historyEditor.addToHistory = (text: string) => {
 				origAdd(text);
-				if (persistEnabled) saveHistory(editor.history);
+				if (persistEnabled) saveHistory(historyEditor.history!);
 			};
-			const origInput = editor.handleInput.bind(editor);
-			editor.handleInput = (data: string) => {
+			const origInput = historyEditor.handleInput.bind(editor);
+			historyEditor.handleInput = (data: string) => {
 				persistEnabled = true;
 				origInput(data);
 			};

@@ -1,10 +1,13 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 const CONFIG_PATH = join(homedir(), ".pi", "web-search.json");
+const MAX_QUERIES = 4;
+const REQUEST_TIMEOUT_MS = 30_000;
 
 function getApiKey(): string | null {
 	const env = process.env.SERPER_API_KEY;
@@ -47,15 +50,17 @@ export default function (pi: ExtensionAPI) {
 			"For web lookups, prefer google_search (raw Google results via Serper) as the default. Use web_search only when the user explicitly wants a synthesized answer or multi-source narrative.",
 		],
 		parameters: Type.Object({
-			query: Type.Optional(Type.String({ description: "Single search query." })),
+			query: Type.Optional(Type.String({ description: "Single search query.", minLength: 1 })),
 			queries: Type.Optional(
-				Type.Array(Type.String(), {
+				Type.Array(Type.String({ minLength: 1 }), {
 					description:
 						"Multiple queries searched in sequence. Vary phrasing/scope across 2-4 queries for broader coverage.",
+					minItems: 1,
+					maxItems: MAX_QUERIES,
 				}),
 			),
 			num: Type.Optional(
-				Type.Number({ description: "Results per query (default 10, max 100).", minimum: 1, maximum: 100 }),
+				Type.Integer({ description: "Results per query (default 10, max 100).", minimum: 1, maximum: 100 }),
 			),
 			gl: Type.Optional(Type.String({ description: "Country code, e.g. 'us', 'de' (default us)." })),
 			hl: Type.Optional(Type.String({ description: "Language code, e.g. 'en', 'de' (default en)." })),
@@ -74,23 +79,38 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const queryList: string[] = Array.isArray(params.queries)
+			const rawQueries: string[] = Array.isArray(params.queries)
 				? params.queries
 				: params.query !== undefined
 					? [params.query]
 					: [];
-			if (queryList.length === 0) {
+			if (rawQueries.length === 0) {
 				return {
 					content: [{ type: "text", text: "Error: No query provided. Use 'query' or 'queries'." }],
 					details: { error: "No query provided" },
 				};
 			}
-
-			const num = Math.min(Math.max(params.num ?? 10, 1), 100);
+			if (rawQueries.length > MAX_QUERIES || rawQueries.some((query) => query.trim().length === 0)) {
+				return {
+					content: [{ type: "text", text: `Error: Provide 1-${MAX_QUERIES} non-blank queries.` }],
+					details: { error: "Invalid queries" },
+				};
+			}
+			const queryList = rawQueries.map((query) => query.trim());
+			const num = params.num ?? 10;
+			if (!Number.isInteger(num) || num < 1 || num > 100) {
+				return {
+					content: [{ type: "text", text: "Error: 'num' must be an integer from 1 to 100." }],
+					details: { error: "Invalid result count" },
+				};
+			}
 			const allResults: Array<{ query: string; results: SerperResult[]; error?: string }> = [];
 			let totalResults = 0;
 
 			for (let i = 0; i < queryList.length; i++) {
+				if (signal?.aborted) {
+					throw signal.reason instanceof Error ? signal.reason : new Error("Search cancelled");
+				}
 				const q = queryList[i];
 				onUpdate?.({
 					content: [{ type: "text", text: `Searching Google (${i + 1}/${queryList.length}): "${q}"` }],
@@ -98,6 +118,8 @@ export default function (pi: ExtensionAPI) {
 				});
 
 				try {
+					const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+					const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 					const res = await fetch("https://google.serper.dev/search", {
 						method: "POST",
 						headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
@@ -107,7 +129,7 @@ export default function (pi: ExtensionAPI) {
 							...(params.gl ? { gl: params.gl } : {}),
 							...(params.hl ? { hl: params.hl } : {}),
 						}),
-						signal: signal ?? AbortSignal.timeout(30000),
+						signal: requestSignal,
 					});
 
 					if (!res.ok) {
@@ -125,6 +147,9 @@ export default function (pi: ExtensionAPI) {
 					allResults.push({ query: q, results: organic });
 					totalResults += organic.length;
 				} catch (err) {
+					if (signal?.aborted) {
+						throw signal.reason instanceof Error ? signal.reason : new Error("Search cancelled");
+					}
 					const msg = err instanceof Error ? err.message : String(err);
 					allResults.push({ query: q, results: [], error: msg });
 				}

@@ -19,6 +19,8 @@ Tools:
 
 Use `bash_background` for finite long jobs like builds/tests, and `monitor` for streaming commands like dev servers or `tail -F`. `bash_background` requires a unit-bearing timeout such as `"30m"` or `"2h"` (maximum `24h`); bare numbers are rejected. `monitor` remains unbounded until stopped or the session shuts down.
 
+Logs use random exclusive files with mode `0600`. They remain readable for 24 hours after completion and are then removed; stale logs are also cleaned on extension startup.
+
 #### Install
 
 Symlink into pi's global extensions directory:
@@ -61,6 +63,26 @@ pi install git:github.com/fl4p/pi-extensions
 
 Then restart pi (or `/reload`).
 
+### google-search
+
+Adds `google_search`, which queries Google through [Serper](https://serper.dev) and returns raw titles, links, and snippets without model synthesis. Each call accepts one query or up to four query variants, with a 30-second deadline per request.
+
+Set the API key through the environment:
+
+```bash
+export SERPER_API_KEY="..."
+```
+
+Or store it in `~/.pi/web-search.json` and restrict the file permissions:
+
+```json
+{ "serperApiKey": "..." }
+```
+
+```bash
+chmod 600 ~/.pi/web-search.json
+```
+
 ### block-web-search
 
 Removes `web_search` (the Gemini-synthesis provider) from the active tool set at `session_start`, forcing the agent to use `google_search` (raw Google blue links via Serper) + `ctx_fetch_and_index` / `fetch_content` for primary sources instead.
@@ -71,10 +93,17 @@ Hard block at the tool layer — the tool is removed before the agent sees it, s
 
 #### Install
 
-Symlink into pi's global extensions directory:
+Install both the replacement and blocker together:
 
 ```bash
-ln -s /Users/fab/dev/vibe/pi-extensions/extensions/block-web-search.ts ~/.pi/agent/extensions/block-web-search.ts
+ln -s /path/to/pi-extensions/extensions/google-search.ts ~/.pi/agent/extensions/google-search.ts
+ln -s /path/to/pi-extensions/extensions/block-web-search.ts ~/.pi/agent/extensions/block-web-search.ts
+```
+
+Or install the package, which loads both in the correct order:
+
+```bash
+pi install git:github.com/fl4p/pi-extensions
 ```
 
 Then restart pi (or `/reload`).
@@ -85,7 +114,7 @@ Makes pi's `<up>`/`<down>` editor prompt history persist across sessions and res
 
 pi keeps prompt history in memory on the `Editor` component. On startup it rebuilds that history from the *current session file*, so the history is per-session and never survives as a global, cross-session history. This extension seeds the editor from a JSON file on startup and writes new submissions back, so arrow-up recalls prompts across sessions and restarts.
 
-History is stored at `~/.pi/agent/editor-history.json` (most-recent-first, capped at 100 entries).
+History is stored at `~/.pi/agent/editor-history.json` (most-recent-first, capped at 100 entries). Concurrent sessions merge under a lock, and updates use atomic mode-`0600` replacement.
 
 #### Install
 
@@ -122,6 +151,14 @@ ln -s /path/to/pi-extensions/extensions/turn-timer.ts ~/.pi/agent/extensions/tur
 ```
 
 Then restart pi (or `/reload`).
+
+## Development
+
+```bash
+npm install
+npm test
+npm run typecheck
+```
 
 ## License
 

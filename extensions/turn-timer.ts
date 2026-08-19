@@ -1,9 +1,10 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-function formatDuration(ms: number): string {
-	const s = ms / 1000;
-	if (s < 60) return `${s.toFixed(1)}s`;
-	return `${Math.floor(s / 60)}m${Math.round(s % 60)}s`;
+export function formatDuration(ms: number): string {
+	const seconds = ms / 1000;
+	const roundedSeconds = Math.round(seconds);
+	if (roundedSeconds < 60) return `${seconds.toFixed(1)}s`;
+	return `${Math.floor(roundedSeconds / 60)}m${roundedSeconds % 60}s`;
 }
 
 export default function (pi: ExtensionAPI) {

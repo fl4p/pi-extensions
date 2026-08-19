@@ -1,5 +1,5 @@
 import { Text } from "@earendil-works/pi-tui";
-import { createBashTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createBashToolDefinition, defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 const MAX_TIMEOUT_SECONDS = 60 * 60;
@@ -39,10 +39,7 @@ const bashSchema = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
-	const base = createBashTool(process.cwd());
-
-	pi.registerTool({
-		...base,
+	const bash = defineTool({
 		name: "bash",
 		label: "bash",
 		description:
@@ -57,7 +54,7 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const timeout = params.timeout === undefined ? undefined : parseDurationSeconds(params.timeout);
-			const tool = createBashTool(ctx.cwd);
+			const tool = createBashToolDefinition(ctx.cwd);
 			return tool.execute(toolCallId, { command: params.command, timeout }, signal, onUpdate, ctx);
 		},
 
@@ -74,4 +71,5 @@ export default function (pi: ExtensionAPI) {
 			return text;
 		},
 	});
+	pi.registerTool(bash);
 }

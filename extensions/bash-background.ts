@@ -20,7 +20,8 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { closeSync, openSync, writeSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { constants, closeSync, openSync, readdirSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
@@ -40,11 +41,13 @@ interface Job {
 	timeout?: string;
 	timedOut?: boolean;
 	timeoutHandle?: ReturnType<typeof setTimeout>;
+	killHandle?: ReturnType<typeof setTimeout>;
 	// monitor-only state:
 	logfd?: number;
 	pending?: string[]; // complete lines not yet delivered
 	pendingBytes?: number;
 	carry?: string; // partial trailing line across chunks
+	droppingLine?: boolean;
 	truncated?: boolean; // pending was capped since last flush
 	flushTimer?: ReturnType<typeof setInterval>;
 }
@@ -55,6 +58,8 @@ interface Job {
 const MONITOR_FLUSH_MS = 200;
 const MONITOR_MAX_PENDING_BYTES = 8_000;
 const MAX_BACKGROUND_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+const LOG_RETENTION_MS = 24 * 60 * 60 * 1000;
+const LOG_PREFIX = "pi-bg-";
 const DURATION_PATTERN = "^[0-9]+(?:\\.[0-9]+)?(?:ms|s|m|h)$";
 const DURATION_RE = /^([0-9]+(?:\.[0-9]+)?)(ms|s|m|h)$/;
 const MILLISECONDS_PER_UNIT = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 } as const;
@@ -75,16 +80,66 @@ function parseDurationMs(duration: string): number {
 }
 
 // Watch-shaped commands never exit, so bash_background's wake-on-exit never fires.
-// Weak instruction-followers ignore the prose guideline and run them here anyway;
-// this catches the common shapes and hard-refuses, naming `monitor` so the model
-// has to re-route. Deliberately conservative (only unambiguous follow/loop forms)
-// to avoid refusing a legitimate finite job.
+// Match only at a real shell-command boundary; ordinary arguments such as
+// `echo watch` must remain valid finite commands.
 const WATCH_SHAPED =
-	/(^|[|;&]|\s)(tail\s+(-[a-zA-Z]*[fF]\b|--follow)|watch\b|journalctl\b[^|;&]*\s-f\b|while\s+(true\b|:)|until\s+false\b|for\s*\(\(\s*;\s*;\s*\)\))/;
+	/(?:^|[|;&]\s*|\n\s*)(?:tail\s+(?:-[a-zA-Z]*[fF]\b|--follow)|watch\b|journalctl\b[^|;&]*\s-f\b|while\s+(?:true\b|:)|until\s+false\b|for\s*\(\(\s*;\s*;\s*\)\))/;
+
+const SUPERVISOR_SOURCE = [
+	'const { spawn, spawnSync } = require("node:child_process");',
+	"const [shell, command] = process.argv.slice(1);",
+	'process.on("SIGTERM", () => {});',
+	'process.on("SIGINT", () => {});',
+	'const child = spawn(shell, ["-c", command], { stdio: "inherit" });',
+	'child.on("error", () => process.exit(1));',
+	'child.on("exit", (code) => {',
+	'  const check = () => {',
+	'    const result = spawnSync("ps", ["-o", "pid=", "-g", String(process.pid)], { encoding: "utf8", detached: true });',
+	'    if (result.status !== 0) return setTimeout(check, 50);',
+	'    const others = result.stdout.split(/\\s+/).filter(Boolean).some((pid) => Number(pid) !== process.pid);',
+	'    if (others) return setTimeout(check, 50);',
+	'    process.exit(code ?? 1);',
+	'  };',
+	'  check();',
+	'});',
+].join("\n");
+
+function createLogFile(id: string): { logpath: string; logfd: number } {
+	const logpath = join(tmpdir(), `${LOG_PREFIX}${id}-${randomUUID()}.log`);
+	const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL;
+	return { logpath, logfd: openSync(logpath, flags, 0o600) };
+}
+
+function cleanupOldLogs(now = Date.now()): void {
+	try {
+		for (const name of readdirSync(tmpdir())) {
+			if (!name.startsWith(LOG_PREFIX) || !name.endsWith(".log")) continue;
+			const path = join(tmpdir(), name);
+			try {
+				if (now - statSync(path).mtimeMs > LOG_RETENTION_MS) unlinkSync(path);
+			} catch {
+				/* raced with another cleanup */
+			}
+		}
+	} catch {
+		/* temp directory unavailable */
+	}
+}
+
+function scheduleLogCleanup(logpath: string): void {
+	setTimeout(() => {
+		try {
+			unlinkSync(logpath);
+		} catch {
+			/* already removed */
+		}
+	}, LOG_RETENTION_MS).unref();
+}
 
 export default function (pi: ExtensionAPI) {
 	const jobs = new Map<string, Job>();
 	let seq = 0;
+	cleanupOldLogs();
 
 	// Track streaming state ourselves: ExtensionAPI has no isIdle(), and the
 	// wake must pick the right delivery mode at fire time.
@@ -108,33 +163,56 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	function killTree(child: ChildProcess) {
-		if (child.pid === undefined) return;
-		// detached:true => child leads its own process group, so -pid hits the
-		// whole tree. SIGTERM first, SIGKILL backstop for ignorers.
+	function killTree(job: Job, immediate = false) {
+		const { child } = job;
+		if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+		if (job.killHandle) {
+			if (!immediate) return;
+			clearTimeout(job.killHandle);
+			job.killHandle = undefined;
+		}
 		try {
 			process.kill(-child.pid, "SIGTERM");
 		} catch {
-			/* already gone */
+			return;
 		}
-		setTimeout(() => {
+		if (immediate) {
+			try {
+				process.kill(-child.pid, "SIGKILL");
+			} catch {
+				/* already gone */
+			}
+			return;
+		}
+		job.killHandle = setTimeout(() => {
+			job.killHandle = undefined;
+			// A live leader proves this is still the original process group; once
+			// it exits, its numeric PGID must never be signalled again.
+			if (child.exitCode !== null || child.signalCode !== null) return;
 			try {
 				process.kill(-child.pid!, "SIGKILL");
 			} catch {
 				/* already gone */
 			}
-		}, 2000).unref();
+		}, 2000);
+		job.killHandle.unref();
 	}
 
 	function newId() {
 		return `bg-${seq++}`;
 	}
 
-	function logpathFor(id: string) {
-		return join(tmpdir(), `pi-${id}-${Date.now()}.log`);
-	}
-
 	// ---- monitor line handling --------------------------------------------
+
+	function queueLine(job: Job, line: string) {
+		const bytes = Buffer.byteLength(line, "utf8") + 1;
+		if (bytes > MONITOR_MAX_PENDING_BYTES || (job.pendingBytes ?? 0) + bytes > MONITOR_MAX_PENDING_BYTES) {
+			job.truncated = true;
+			return;
+		}
+		job.pending!.push(line);
+		job.pendingBytes = (job.pendingBytes ?? 0) + bytes;
+	}
 
 	function ingest(job: Job, chunk: Buffer) {
 		if (job.logfd !== undefined) {
@@ -144,18 +222,25 @@ export default function (pi: ExtensionAPI) {
 				/* logfile gone; keep streaming to the model anyway */
 			}
 		}
-		const text = (job.carry ?? "") + chunk.toString("utf8");
-		const parts = text.split("\n");
-		job.carry = parts.pop() ?? ""; // last element is the partial trailing line
-		for (const line of parts) {
-			const pending = job.pending!;
-			if ((job.pendingBytes ?? 0) + line.length > MONITOR_MAX_PENDING_BYTES) {
-				job.truncated = true;
-				continue; // drop oldest-style: keep batch bounded
-			}
-			pending.push(line);
-			job.pendingBytes = (job.pendingBytes ?? 0) + line.length + 1;
+
+		let incoming = chunk.toString("utf8");
+		if (job.droppingLine) {
+			const newline = incoming.indexOf("\n");
+			if (newline === -1) return;
+			incoming = incoming.slice(newline + 1);
+			job.droppingLine = false;
 		}
+
+		const parts = `${job.carry ?? ""}${incoming}`.split("\n");
+		const carry = parts.pop() ?? "";
+		if (Buffer.byteLength(carry, "utf8") > MONITOR_MAX_PENDING_BYTES) {
+			job.carry = "";
+			job.droppingLine = true;
+			job.truncated = true;
+		} else {
+			job.carry = carry;
+		}
+		for (const line of parts) queueLine(job, line);
 	}
 
 	function flush(job: Job) {
@@ -173,6 +258,7 @@ export default function (pi: ExtensionAPI) {
 		if (job.done) return;
 		job.done = true;
 		if (job.timeoutHandle) clearTimeout(job.timeoutHandle);
+		if (job.killHandle) clearTimeout(job.killHandle);
 		if (job.flushTimer) clearInterval(job.flushTimer);
 		if (job.logfd !== undefined) {
 			try {
@@ -182,6 +268,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		jobs.delete(job.id);
+		scheduleLogCleanup(job.logpath);
 		if (!job.stopped) wake(text);
 	}
 
@@ -233,18 +320,17 @@ export default function (pi: ExtensionAPI) {
 			const timeoutMs = parseDurationMs(params.timeout);
 			const id = newId();
 			const description = params.description?.trim() || params.command.slice(0, 60);
-			const logpath = logpathFor(id);
-
-			let logfd: number;
+			let log: ReturnType<typeof createLogFile>;
 			try {
-				logfd = openSync(logpath, "w");
+				log = createLogFile(id);
 			} catch (err) {
-				return errorResult(id, `Failed to open logfile ${logpath}: ${String(err)}`);
+				return errorResult(id, `Failed to create logfile: ${String(err)}`);
 			}
+			const { logpath, logfd } = log;
 
 			let child: ChildProcess;
 			try {
-				child = spawn(process.env.SHELL || "/bin/sh", ["-c", params.command], {
+				child = spawn(process.execPath, ["-e", SUPERVISOR_SOURCE, process.env.SHELL || "/bin/sh", params.command], {
 					cwd: ctx.cwd,
 					env: process.env,
 					detached: true,
@@ -271,7 +357,7 @@ export default function (pi: ExtensionAPI) {
 			job.timeoutHandle = setTimeout(() => {
 				if (job.done) return;
 				job.timedOut = true;
-				killTree(job.child);
+				killTree(job);
 			}, timeoutMs);
 			job.timeoutHandle.unref();
 
@@ -313,18 +399,17 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx: ExtensionContext) {
 			const id = newId();
 			const description = params.description?.trim() || params.command.slice(0, 60);
-			const logpath = logpathFor(id);
-
-			let logfd: number;
+			let log: ReturnType<typeof createLogFile>;
 			try {
-				logfd = openSync(logpath, "w");
+				log = createLogFile(id);
 			} catch (err) {
-				return errorResult(id, `Failed to open logfile ${logpath}: ${String(err)}`);
+				return errorResult(id, `Failed to create logfile: ${String(err)}`);
 			}
+			const { logpath, logfd } = log;
 
 			let child: ChildProcess;
 			try {
-				child = spawn(process.env.SHELL || "/bin/sh", ["-c", params.command], {
+				child = spawn(process.execPath, ["-e", SUPERVISOR_SOURCE, process.env.SHELL || "/bin/sh", params.command], {
 					cwd: ctx.cwd,
 					env: process.env,
 					detached: true,
@@ -348,6 +433,7 @@ export default function (pi: ExtensionAPI) {
 				pending: [],
 				pendingBytes: 0,
 				carry: "",
+				droppingLine: false,
 				truncated: false,
 			};
 			jobs.set(id, job);
@@ -361,14 +447,13 @@ export default function (pi: ExtensionAPI) {
 			// trailing partial line and last buffered lines are captured before the
 			// final wake (exit can fire while pipe data is still pending).
 			child.on("close", (code, signal) => {
-				// Drain any trailing partial line, deliver the last batch, and the
-				// exit notice — all in the single final wake.
-				if (job.carry && job.carry.length > 0) {
-					job.pending!.push(job.carry);
-					job.carry = "";
-				}
-				const tail = job.pending!.length > 0 ? `\nFinal output:\n${job.pending!.join("\n")}` : "";
+				if (job.carry) queueLine(job, job.carry);
+				job.carry = "";
+				const body = job.pending!.join("\n");
+				const note = job.truncated ? "\n(some output dropped — Read the logfile for the full stream)" : "";
+				const tail = body || note ? `\nFinal output:\n${body}${note}` : "";
 				job.pending!.length = 0;
+				job.pendingBytes = 0;
 				finish(
 					job,
 					`[monitor:${description}] (${id}) ${exitClause(code, signal)}. Full output in ${logpath}.${tail}`,
@@ -406,7 +491,7 @@ export default function (pi: ExtensionAPI) {
 					/* ignore */
 				}
 			}
-			killTree(job.child);
+			killTree(job);
 			jobs.delete(params.id);
 			return {
 				content: [
@@ -476,7 +561,7 @@ export default function (pi: ExtensionAPI) {
 			job.stopped = true;
 			if (job.timeoutHandle) clearTimeout(job.timeoutHandle);
 			if (job.flushTimer) clearInterval(job.flushTimer);
-			killTree(job.child);
+			killTree(job, true);
 		}
 		jobs.clear();
 	});
