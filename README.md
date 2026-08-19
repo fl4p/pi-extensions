@@ -4,6 +4,37 @@ Personal extensions for [pi](https://github.com/earendil-works/pi-coding-agent),
 
 ## Extensions
 
+### bash-background
+
+Run shell commands detached and wake the agent when they produce output or finish.
+
+Tools:
+
+| Tool | What it does |
+|------|--------------|
+| `bash_background({ command, timeout, description? })` | Spawn detached, capture combined stdout+stderr to a logfile, return immediately. Wake once on exit or timeout. |
+| `monitor({ command, description? })` | Spawn detached and wake on new output in coalesced batches, plus once on exit. |
+| `background_stop({ id })` | Tree-kill a running job by id. |
+| `background_list()` | List live jobs. |
+
+Use `bash_background` for finite long jobs like builds/tests, and `monitor` for streaming commands like dev servers or `tail -F`. `bash_background` requires a unit-bearing timeout such as `"30m"` or `"2h"` (maximum `24h`); bare numbers are rejected. `monitor` remains unbounded until stopped or the session shuts down.
+
+#### Install
+
+Symlink into pi's global extensions directory:
+
+```bash
+ln -s /path/to/pi-extensions/extensions/bash-background.ts ~/.pi/agent/extensions/bash-background.ts
+```
+
+Or install this repo as a pi package:
+
+```bash
+pi install git:github.com/fl4p/pi-extensions
+```
+
+Then restart pi (or `/reload`).
+
 ### bash-duration
 
 Overrides pi's built-in `bash` tool so timeout values require explicit units:

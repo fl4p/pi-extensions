@@ -6,6 +6,7 @@
   "type": "module",
   "pi": {
     "extensions": [
+      "./extensions/bash-background.ts",
       "./extensions/bash-duration.ts",
       "./extensions/persistent-history.ts"
     ]
