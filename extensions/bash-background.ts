@@ -11,9 +11,9 @@
  *   background_stop({ id })                    — tree-kill a job; no wake.
  *   background_list()                          — list live jobs.
  *
- * The wake is `pi.sendUserMessage(...)`, which "always triggers a turn". We use
- * the session-bound `pi` handle (NOT a captured execute-ctx) so the wake follows
- * the active session instead of throwing on a stale ctx after fork/reload.
+ * Wakes use `pi.sendMessage(..., { triggerTurn: true })` only after the agent is
+ * settled. This bypasses the user-input queue while preserving a normal model turn.
+ * The session-bound `pi` handle keeps wakes attached to the active session.
  *
  * Install:  pi -e /path/to/pi-bash-background/src/index.ts
  *   or symlink src/index.ts into ~/.pi/agent/extensions/ (see README).
@@ -141,25 +141,51 @@ export default function (pi: ExtensionAPI) {
 	let seq = 0;
 	cleanupOldLogs();
 
-	// Track streaming state ourselves: ExtensionAPI has no isIdle(), and the
-	// wake must pick the right delivery mode at fire time.
-	let streaming = false;
+	type DeferredWake = { jobId: string; text: string };
+
+	let busy = false;
+	const deferredWakes: DeferredWake[] = [];
 	pi.on("agent_start", () => {
-		streaming = true;
+		busy = true;
 	});
-	pi.on("agent_end", () => {
-		streaming = false;
+	pi.on("agent_settled", () => {
+		busy = false;
+		dispatchPendingWakes();
 	});
 
-	function wake(text: string) {
-		// Always triggers a turn when idle; while streaming, queue as a follow-up
-		// so a wake never truncates the in-flight turn. Stay non-fatal — a failed
-		// wake (e.g. session mid-teardown) must not crash the watcher.
+	function enqueueWake(jobId: string, text: string) {
+		deferredWakes.push({ jobId, text });
+		dispatchPendingWakes();
+	}
+
+	function drainMonitorBatch(job: Job): string | undefined {
+		if (job.stopped || job.done || (job.pending!.length === 0 && !job.truncated)) return undefined;
+		const body = job.pending!.join("\n");
+		job.pending!.length = 0;
+		job.pendingBytes = 0;
+		const note = job.truncated ? "\n(some lines dropped this batch — Read the logfile for full output)" : "";
+		job.truncated = false;
+		return `[monitor:${job.description}] (${job.id}) new output:\n${body}${note}`;
+	}
+
+	function dispatchPendingWakes() {
+		if (busy) return;
+		const messages = deferredWakes.splice(0).map((entry) => entry.text);
+		for (const job of jobs.values()) {
+			if (job.kind !== "monitor") continue;
+			const message = drainMonitorBatch(job);
+			if (message) messages.push(message);
+		}
+		if (messages.length === 0) return;
+
+		busy = true;
 		try {
-			if (streaming) pi.sendUserMessage(text, { deliverAs: "followUp" });
-			else pi.sendUserMessage(text);
+			pi.sendMessage(
+				{ customType: "monitor", content: messages.join("\n\n"), display: true },
+				{ triggerTurn: true },
+			);
 		} catch {
-			/* drop */
+			busy = false;
 		}
 	}
 
@@ -205,6 +231,7 @@ export default function (pi: ExtensionAPI) {
 	// ---- monitor line handling --------------------------------------------
 
 	function queueLine(job: Job, line: string) {
+		if (job.stopped || job.done) return;
 		const bytes = Buffer.byteLength(line, "utf8") + 1;
 		if (bytes > MONITOR_MAX_PENDING_BYTES || (job.pendingBytes ?? 0) + bytes > MONITOR_MAX_PENDING_BYTES) {
 			job.truncated = true;
@@ -215,6 +242,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function ingest(job: Job, chunk: Buffer) {
+		if (job.stopped || job.done) return;
 		if (job.logfd !== undefined) {
 			try {
 				writeSync(job.logfd, chunk);
@@ -244,14 +272,8 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function flush(job: Job) {
-		const pending = job.pending!;
-		if (pending.length === 0 && !job.truncated) return;
-		const body = pending.join("\n");
-		pending.length = 0;
-		job.pendingBytes = 0;
-		const note = job.truncated ? "\n(some lines dropped this batch — Read the logfile for full output)" : "";
-		job.truncated = false;
-		wake(`[monitor:${job.description}] (${job.id}) new output:\n${body}${note}`);
+		if (job.stopped || job.done || (job.pending!.length === 0 && !job.truncated)) return;
+		dispatchPendingWakes();
 	}
 
 	function finish(job: Job, text: string) {
@@ -269,7 +291,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		jobs.delete(job.id);
 		scheduleLogCleanup(job.logpath);
-		if (!job.stopped) wake(text);
+		if (!job.stopped) enqueueWake(job.id, text);
 	}
 
 	function exitClause(code: number | null, signal: NodeJS.Signals | null) {
@@ -381,8 +403,9 @@ export default function (pi: ExtensionAPI) {
 		name: "monitor",
 		label: "Monitor",
 		description:
-			"Run a shell command detached and get woken on NEW output (batched, not one turn per line); " +
-			"stdout+stderr also go to a logfile you can Read for the full stream. For watching a streaming " +
+			"Run a shell command detached and get woken on NEW output (batched, not one turn per line). " +
+			"While the agent is busy, output stays extension-local and becomes one wake after it settles; stopping " +
+			"the monitor discards that undelivered batch. stdout+stderr also go to a logfile for the full stream. For watching a streaming " +
 			"source (dev server, tail -F, a growing log). For a one-shot 'tell me when it's done', use " +
 			"bash_background instead.",
 		promptSnippet: "monitor({command, description}): run a command detached; get woken on new output (batched).",
@@ -482,6 +505,13 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			job.stopped = true;
+			if (job.pending) job.pending.length = 0;
+			job.pendingBytes = 0;
+			job.carry = "";
+			job.truncated = false;
+			for (let i = deferredWakes.length - 1; i >= 0; i--) {
+				if (deferredWakes[i]!.jobId === job.id) deferredWakes.splice(i, 1);
+			}
 			if (job.timeoutHandle) clearTimeout(job.timeoutHandle);
 			if (job.flushTimer) clearInterval(job.flushTimer);
 			if (job.logfd !== undefined) {
@@ -557,8 +587,10 @@ export default function (pi: ExtensionAPI) {
 
 	// Best-effort cleanup so we never leak detached process groups.
 	pi.on("session_shutdown", () => {
+		deferredWakes.length = 0;
 		for (const job of jobs.values()) {
 			job.stopped = true;
+			if (job.pending) job.pending.length = 0;
 			if (job.timeoutHandle) clearTimeout(job.timeoutHandle);
 			if (job.flushTimer) clearInterval(job.flushTimer);
 			killTree(job, true);

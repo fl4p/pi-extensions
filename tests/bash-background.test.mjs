@@ -9,6 +9,7 @@ function createHarness() {
 	const tools = new Map();
 	const handlers = new Map();
 	const messages = [];
+	const userMessages = [];
 	const pi = {
 		registerTool(tool) {
 			tools.set(tool.name, tool);
@@ -18,12 +19,15 @@ function createHarness() {
 			entries.push(handler);
 			handlers.set(name, entries);
 		},
+		sendMessage(message) {
+			messages.push(message.content);
+		},
 		sendUserMessage(message) {
-			messages.push(message);
+			userMessages.push(message);
 		},
 	};
 	bashBackgroundExtension(pi);
-	return { tools, handlers, messages };
+	return { tools, handlers, messages, userMessages };
 }
 
 async function waitFor(predicate, timeoutMs = 2000) {
@@ -48,6 +52,11 @@ function removeLog(path) {
 	try {
 		unlinkSync(path);
 	} catch {}
+}
+
+async function stopAndWait(stop, result) {
+	await stop.execute("stop", { id: result.details.id }, undefined, undefined, { cwd: process.cwd() });
+	await waitFor(() => !isAlive(result.details.pid), 4000);
 }
 
 test("bash_background requires a timeout without rejecting ordinary arguments", async () => {
@@ -169,6 +178,97 @@ test("session shutdown immediately kills every supervised process group", async 
 	} finally {
 		process.kill = originalKill;
 		if (result) removeLog(result.details.logpath);
+	}
+});
+
+test("monitor holds busy output locally and releases one batch after agent_settled", async () => {
+	const { tools, handlers, messages } = createHarness();
+	const monitor = tools.get("monitor");
+	const stop = tools.get("background_stop");
+	for (const handler of handlers.get("agent_start") ?? []) await handler();
+
+	const result = await monitor.execute(
+		"monitor",
+		{
+			command: `node -e "console.log('first'); console.log('second'); setInterval(() => {}, 1000)"`,
+			description: "busy-batch",
+		},
+		undefined,
+		undefined,
+		{ cwd: process.cwd() },
+	);
+	try {
+		await waitFor(() => readFileSync(result.details.logpath, "utf8").includes("second"));
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		assert.deepEqual(messages, []);
+
+		for (const handler of handlers.get("agent_settled") ?? []) await handler();
+		assert.equal(messages.length, 1);
+		assert.match(messages[0], /first/);
+		assert.match(messages[0], /second/);
+	} finally {
+		await stopAndWait(stop, result);
+		removeLog(result.details.logpath);
+	}
+});
+
+test("monitor completion waits for the active custom wake and does not repeat output", async () => {
+	const { tools, handlers, messages, userMessages } = createHarness();
+	const monitor = tools.get("monitor");
+	const result = await monitor.execute(
+		"monitor",
+		{
+			command: `node -e "console.log('first'); setTimeout(() => process.exit(0), 400)"`,
+			description: "exit-during-wake",
+		},
+		undefined,
+		undefined,
+		{ cwd: process.cwd() },
+	);
+	try {
+		await waitFor(() => messages.length === 1);
+		await waitFor(() => !isAlive(result.details.pid), 3000);
+		assert.equal(messages.length, 1);
+		assert.match(messages[0], /first/);
+		assert.deepEqual(userMessages, []);
+
+		for (const handler of handlers.get("agent_settled") ?? []) await handler();
+		assert.equal(messages.length, 2);
+		assert.doesNotMatch(messages[1], /first/);
+		assert.match(messages[1], /exited with code 0/);
+	} finally {
+		removeLog(result.details.logpath);
+	}
+});
+
+test("background_stop discards monitor output accumulated while the agent is busy", async () => {
+	const { tools, handlers, messages } = createHarness();
+	const monitor = tools.get("monitor");
+	const stop = tools.get("background_stop");
+	for (const handler of handlers.get("agent_start") ?? []) await handler();
+
+	const result = await monitor.execute(
+		"monitor",
+		{
+			command: `node -e "console.log('must-not-wake'); setInterval(() => {}, 1000)"`,
+			description: "cancel-pending",
+		},
+		undefined,
+		undefined,
+		{ cwd: process.cwd() },
+	);
+	try {
+		await waitFor(() => readFileSync(result.details.logpath, "utf8").includes("must-not-wake"));
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		assert.deepEqual(messages, []);
+
+		await stopAndWait(stop, result);
+		for (const handler of handlers.get("agent_settled") ?? []) await handler();
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		assert.deepEqual(messages, []);
+	} finally {
+		if (isAlive(result.details.pid)) await stopAndWait(stop, result);
+		removeLog(result.details.logpath);
 	}
 });
 

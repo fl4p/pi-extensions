@@ -17,7 +17,7 @@ Tools:
 | `background_stop({ id })` | Tree-kill a running job by id. |
 | `background_list()` | List live jobs. |
 
-Use `bash_background` for finite long jobs like builds/tests, and `monitor` for streaming commands like dev servers or `tail -F`. `bash_background` requires a unit-bearing timeout such as `"30m"` or `"2h"` (maximum `24h`); bare numbers are rejected. `monitor` remains unbounded until stopped or the session shuts down.
+Use `bash_background` for finite long jobs like builds/tests, and `monitor` for streaming commands like dev servers or `tail -F`. `bash_background` requires a unit-bearing timeout such as `"30m"` or `"2h"` (maximum `24h`); bare numbers are rejected. `monitor` remains unbounded until stopped or the session shuts down. While the agent is busy, monitor output stays in one bounded extension-local batch; it is delivered after the agent settles, or discarded if the monitor is stopped first. This prevents uncancellable follow-up messages from accumulating in Pi's input queue.
 
 Logs use random exclusive files with mode `0600`. They remain readable for 24 hours after completion and are then removed; stale logs are also cleaned on extension startup.
 
