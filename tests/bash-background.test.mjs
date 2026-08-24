@@ -20,6 +20,12 @@ function createHarness(options = {}) {
 	// site and no message events are emitted, but _runAgentPrompt's finally still
 	// emits agent_settled.
 	let rejectSends = options.rejectSends ?? 0;
+	// When set, EVERY triggerTurn send is rejected the way the core active-run guard
+	// rejects it (agent.js:226): a foreign run owns activeRun and does not release it,
+	// so the false agent_settled from the rejected wrapper's finally never means the
+	// next attempt can succeed. This is what turns a synchronous retry into a hot loop.
+	const activeRunHeld = options.activeRunHeld ?? false;
+	const sendTimes = [];
 
 	const emit = async (name, event) => {
 		for (const handler of handlers.get(name) ?? []) await handler(event);
@@ -37,12 +43,13 @@ function createHarness(options = {}) {
 		sendMessage(message, sendOptions) {
 			messages.push(message.content);
 			if (!sendOptions?.triggerTurn) return;
+			sendTimes.push(Date.now());
 			// Pi's runAgentLoop emits agent_start, then message_start/message_end for
 			// every prompt message (custom ones included), before the provider call.
 			// agent_settled is driven by the test, as pi drives it from the run's end.
 			void (async () => {
-				if (rejectSends > 0) {
-					rejectSends -= 1;
+				if (activeRunHeld || rejectSends > 0) {
+					if (!activeRunHeld) rejectSends -= 1;
 					await emit("agent_settled");
 					return;
 				}
@@ -55,8 +62,8 @@ function createHarness(options = {}) {
 			userMessages.push(message);
 		},
 	};
-	bashBackgroundExtension(pi);
-	return { tools, handlers, messages, userMessages, emit };
+	bashBackgroundExtension(pi, options.extension);
+	return { tools, handlers, messages, userMessages, emit, sendTimes };
 }
 
 async function waitFor(predicate, timeoutMs = 2000) {
@@ -310,6 +317,95 @@ test("a terminal wake held during compaction is pumped out, not stranded", async
 		// No further lifecycle event is emitted: only the pump can deliver this.
 		await waitFor(() => messages.length === 1, 3000);
 		assert.match(messages[0], /exited with code 3/);
+	} finally {
+		removeLog(result.details.logpath);
+	}
+});
+
+test("a persistently rejected send backs off instead of spinning", async () => {
+	// The core active-run guard keeps rejecting while a foreign run holds activeRun,
+	// and each rejected wrapper emits a false agent_settled from its finally. Retrying
+	// on that settlement synchronously spins at microtask speed and starves the owner.
+	const { tools, sendTimes, messages } = createHarness({ activeRunHeld: true });
+	const background = tools.get("bash_background");
+	const result = await background.execute(
+		"bash_background",
+		{ command: `node -e "process.exit(5)"`, timeout: "30s", description: "spin-guard" },
+		undefined,
+		undefined,
+		{ cwd: process.cwd() },
+	);
+	try {
+		await waitFor(() => sendTimes.length >= 1, 3000);
+		await new Promise((resolve) => setTimeout(resolve, 2000));
+		// Backoff is 500 ms doubling: within ~2 s of the first attempt only a handful
+		// of retries are possible. A synchronous retry loop produces thousands.
+		assert.ok(sendTimes.length <= 6, `expected a backed-off retry count, got ${sendTimes.length}`);
+		assert.ok(messages.every((message) => /exited with code 5/.test(message)));
+
+		// Gaps must grow, not stay flat.
+		if (sendTimes.length >= 3) {
+			const first = sendTimes[1] - sendTimes[0];
+			const last = sendTimes[sendTimes.length - 1] - sendTimes[sendTimes.length - 2];
+			assert.ok(last >= first, `expected widening backoff, got ${first}ms then ${last}ms`);
+		}
+	} finally {
+		removeLog(result.details.logpath);
+	}
+});
+
+test("an accepted send is never requeued, even if a foreign settle arrives first", async () => {
+	const { tools, emit, messages } = createHarness();
+	const background = tools.get("bash_background");
+	const result = await background.execute(
+		"bash_background",
+		{ command: `node -e "process.exit(11)"`, timeout: "30s", description: "accepted-once" },
+		undefined,
+		undefined,
+		{ cwd: process.cwd() },
+	);
+	try {
+		await waitFor(() => messages.length === 1, 3000);
+		assert.match(messages[0], /exited with code 11/);
+		// A settle for some other run, after ours was acknowledged. Nothing to resend.
+		await emit("agent_settled");
+		await new Promise((resolve) => setTimeout(resolve, PUMP_SETTLE_MS));
+		assert.equal(messages.length, 1, "an acknowledged batch must not be resent");
+	} finally {
+		removeLog(result.details.logpath);
+	}
+});
+
+test("a stale abandoned prompt gate does not collapse the gate for the next prompt", async () => {
+	// Shortened so the orphan can actually go stale within a test.
+	const { tools, emit, messages } = createHarness({ extension: { promptGateMaxMs: 1500 } });
+	const background = tools.get("bash_background");
+	// A prompt that never reaches a run — pi has preflight exits after `input`
+	// (a handled input result, or missing model / expired auth) with no closing event.
+	await emit("input");
+	// Let it go well past its deadline. Its timestamp must not be inherited below.
+	await new Promise((resolve) => setTimeout(resolve, 2000));
+	// A new, legitimate prompt. Its gate must be timed from here, not from the
+	// abandoned one, or a wake arriving now expires immediately and dispatches
+	// inside prompt() — exactly what the gate exists to prevent. No compaction is
+	// emitted here on purpose: `compacting` would hold the gate on its own and mask
+	// whether promptPending was timed correctly.
+	await emit("input");
+
+	const result = await background.execute(
+		"bash_background",
+		{ command: `node -e "process.exit(13)"`, timeout: "30s", description: "stale-gate" },
+		undefined,
+		undefined,
+		{ cwd: process.cwd() },
+	);
+	try {
+		await new Promise((resolve) => setTimeout(resolve, 700));
+		assert.deepEqual(messages, [], "the second prompt's gate must still hold");
+
+		// Its own deadline then expires, and the wake goes out.
+		await waitFor(() => messages.length === 1, 3000);
+		assert.match(messages[0], /exited with code 13/);
 	} finally {
 		removeLog(result.details.logpath);
 	}

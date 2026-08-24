@@ -137,7 +137,12 @@ function scheduleLogCleanup(logpath: string): void {
 	}, LOG_RETENTION_MS).unref();
 }
 
-export default function (pi: ExtensionAPI) {
+/**
+ * `options` is a test seam only. Pi loads extensions as `extension(pi)`, so every
+ * value below is the production one unless a test overrides it; the orphaned-prompt
+ * deadline is otherwise minutes long and cannot be exercised by a unit test.
+ */
+export default function (pi: ExtensionAPI, options?: { promptGateMaxMs?: number }) {
 	const jobs = new Map<string, Job>();
 	let seq = 0;
 	cleanupOldLogs();
@@ -167,81 +172,109 @@ export default function (pi: ExtensionAPI) {
 	// and auto compaction) and session_compact (success only). Registering a
 	// session_before_compact handler is also what makes pi emit the event at all.
 	//
-	// The gate is released by events, not by elapsed time. GATE_MAX_MS exists only for
-	// the one case with no closing event at all — a manual compaction that fails or is
-	// cancelled while the session is otherwise idle — and is deliberately far above any
-	// real compaction (a 270k-token summary took ~105 s, and pi can issue two sequential
-	// summarization calls, each retryable, so there is no tight upper bound to target).
-	const GATE_MAX_MS = 30 * 60 * 1000;
+	// The gate is released by events, never by elapsed time while a compaction is
+	// actually running. Letting a deadline reopen it mid-compaction is not a harmless
+	// collision: the wake starts against the pre-compaction snapshot, compaction then
+	// replaces agent.state.messages under it (agent-session.js:1670), and in the
+	// pre-prompt case the user's original prompt hits the active-run guard and is
+	// dropped. A wake that stalls instead is bounded in practice — any later agent_start
+	// or agent_settled opens the gate, so the next thing the user does releases it.
+	// The one path with no closing event at all is a manual compaction that fails while
+	// the session is otherwise idle, and that is by definition user-initiated.
+	//
+	// promptPending does get a deadline, because prompt() has preflight exits after
+	// `input` that never reach a run: a "handled" input result (agent-session.js:815)
+	// and missing model / expired auth (:847). Those orphan the flag, and an orphan is
+	// only ever a stall. The deadline is suspended while `compacting` is set, so a long
+	// compaction inside the same prompt() cannot expire it.
+	const PROMPT_GATE_MAX_MS = options?.promptGateMaxMs ?? 2 * 60 * 1000;
 	// Finite jobs clear their flush interval in finish(), so a terminal wake declined
 	// while the gate is shut has no timer of its own to retry it. Pump it actively.
 	const PUMP_MS = 500;
+	// A rejected send re-dispatches on a backoff, never synchronously. The main rejection
+	// is the core active-run guard (agent.js:226), and a rejected _runAgentPrompt still
+	// emits agent_settled from its finally (agent-session.js:752) while the owning run is
+	// still live — so an immediate retry hits the same guard and spins at microtask speed.
+	const PUMP_MAX_MS = 30 * 1000;
 
 	let agentBusy = false;
 	let promptPending = false;
+	let promptPendingSince = 0;
 	let compacting = false;
-	let gateSince = 0;
 	let pumpTimer: ReturnType<typeof setTimeout> | undefined;
+	let rejectStreak = 0;
 
 	// A wake batch handed to sendMessage, held until pi acknowledges it. sendMessage is
 	// fire-and-forget (bindCore wraps it in .catch) and drainMonitorBatch() has already
 	// destroyed the job's pending lines, so this is the only copy. The acknowledgement
 	// is the message_end pi emits for each prompt message (agent-loop.js runAgentLoop),
-	// matched on our own wakeId — agent_start is not usable for this, since it fires
-	// before the message events and not at all for a steered message.
+	// matched on our own wakeId.
 	let inFlight: DeferredWake[] = [];
 	let inFlightId: string | undefined;
+	// Whether a run began after the current batch was sent. agent_settled is not causally
+	// tied to our send — a rejected wrapper emits one while another run owns activeRun —
+	// so this distinguishes "never accepted, requeue" from "accepted, ack is imminent".
+	let sawAgentStartSinceSend = false;
 	const deferredWakes: DeferredWake[] = [];
 
+	// Pure: no side effects, so it is safe to call from anywhere.
 	function gateShut() {
 		if (agentBusy || inFlightId !== undefined) return true;
-		if (!promptPending && !compacting) return false;
-		if (Date.now() - gateSince > GATE_MAX_MS) {
-			openGate();
-			return false;
-		}
-		return true;
+		// No deadline while compacting: releasing into a live compaction is the failure
+		// this gate exists to prevent.
+		if (compacting) return true;
+		return promptPending;
 	}
 
-	function shutGate() {
-		if (!promptPending && !compacting) gateSince = Date.now();
+	function releaseOrphanedPromptGate() {
+		if (!promptPending || compacting) return;
+		if (Date.now() - promptPendingSince > PROMPT_GATE_MAX_MS) promptPending = false;
 	}
 
 	function openGate() {
 		promptPending = false;
+		promptPendingSince = 0;
 		compacting = false;
-		gateSince = 0;
 	}
 
-	function armPump() {
+	function armPump(delayMs = PUMP_MS) {
 		if (pumpTimer !== undefined) return;
 		pumpTimer = setTimeout(() => {
 			pumpTimer = undefined;
 			dispatchPendingWakes();
-		}, PUMP_MS);
+		}, delayMs);
 		pumpTimer.unref?.();
 	}
 
-	// A prompt submission is in flight from here until the run starts or the call
-	// bails out. Returning undefined leaves the input untouched (runner.emitInput
-	// only acts on action "handled"/"transform").
+	function backoffMs() {
+		return Math.min(PUMP_MS * 2 ** Math.max(0, rejectStreak - 1), PUMP_MAX_MS);
+	}
+
+	// A prompt submission is in flight from here until the run starts or the call bails
+	// out. Returning undefined leaves the input untouched (runner.emitInput only acts on
+	// action "handled"/"transform"). The timestamp is refreshed on every input: an
+	// abandoned earlier one must not donate its stale deadline to this prompt, or a wake
+	// arriving now would expire it immediately and dispatch inside prompt().
 	pi.on("input", () => {
-		shutGate();
 		promptPending = true;
+		promptPendingSince = Date.now();
 		return undefined;
 	});
 	pi.on("session_before_compact", () => {
-		shutGate();
 		compacting = true;
 		return undefined;
 	});
-	// Deliberately does NOT dispatch: session_compact still runs inside prompt().
+	// Deliberately does NOT dispatch: session_compact still runs inside prompt(), before
+	// the original prompt reaches _runAgentPrompt. Refresh the prompt deadline instead —
+	// what remains of prompt() after this point is fast.
 	pi.on("session_compact", () => {
 		compacting = false;
+		if (promptPending) promptPendingSince = Date.now();
 	});
 
 	pi.on("agent_start", () => {
 		agentBusy = true;
+		if (inFlightId !== undefined) sawAgentStartSinceSend = true;
 		openGate();
 	});
 	// Pi emits message_end for every prompt message before the provider call, custom
@@ -251,6 +284,8 @@ export default function (pi: ExtensionAPI) {
 		if (inFlightId !== undefined && message?.customType === "monitor" && message.details?.wakeId === inFlightId) {
 			inFlight = [];
 			inFlightId = undefined;
+			sawAgentStartSinceSend = false;
+			rejectStreak = 0;
 		}
 		return undefined;
 	});
@@ -258,12 +293,23 @@ export default function (pi: ExtensionAPI) {
 		agentBusy = false;
 		openGate();
 		if (inFlightId !== undefined) {
-			// The run ended without ever acknowledging our message: the send rejected.
-			// Requeue rather than drop it — a lost job-exit wake leaves the agent
-			// waiting forever on a job that already finished.
-			deferredWakes.unshift(...inFlight);
+			const accepted = sawAgentStartSinceSend;
+			const batch = inFlight;
 			inFlight = [];
 			inFlightId = undefined;
+			sawAgentStartSinceSend = false;
+			if (!accepted) {
+				// No run ever began for this batch: the send was rejected. Requeue rather
+				// than drop it — a lost job-exit wake leaves the agent waiting forever on
+				// a job that already finished — but retry on a backoff, never here.
+				deferredWakes.unshift(...batch);
+				rejectStreak += 1;
+				armPump(backoffMs());
+				return;
+			}
+			// A run did begin, so the message was accepted and its message_end either
+			// already arrived or is immediately behind it. Resending would duplicate.
+			rejectStreak = 0;
 		}
 		dispatchPendingWakes();
 	});
@@ -293,9 +339,10 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function dispatchPendingWakes() {
+		releaseOrphanedPromptGate();
 		if (gateShut()) {
 			// Keep retrying: a terminal wake from a finite job has no timer of its own.
-			if (hasPendingWork()) armPump();
+			if (hasPendingWork()) armPump(backoffMs());
 			return;
 		}
 
@@ -310,6 +357,7 @@ export default function (pi: ExtensionAPI) {
 		const wakeId = randomUUID();
 		inFlight = batch;
 		inFlightId = wakeId;
+		sawAgentStartSinceSend = false;
 		try {
 			pi.sendMessage(
 				{
@@ -326,7 +374,9 @@ export default function (pi: ExtensionAPI) {
 			deferredWakes.unshift(...batch);
 			inFlight = [];
 			inFlightId = undefined;
-			armPump();
+			sawAgentStartSinceSend = false;
+			rejectStreak += 1;
+			armPump(backoffMs());
 		}
 	}
 
