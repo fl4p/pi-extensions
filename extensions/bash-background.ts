@@ -12,8 +12,9 @@
  *   background_list()                          — list live jobs.
  *
  * Wakes use `pi.sendMessage(..., { triggerTurn: true })` only after the agent is
- * settled. This bypasses the user-input queue while preserving a normal model turn.
- * The session-bound `pi` handle keeps wakes attached to the active session.
+ * settled AND no compaction is in flight. This bypasses the user-input queue while
+ * preserving a normal model turn. The session-bound `pi` handle keeps wakes attached
+ * to the active session.
  *
  * Install:  pi -e /path/to/pi-bash-background/src/index.ts
  *   or symlink src/index.ts into ~/.pi/agent/extensions/ (see README).
@@ -143,13 +144,68 @@ export default function (pi: ExtensionAPI) {
 
 	type DeferredWake = { jobId: string; text: string };
 
-	let busy = false;
+	// A wake must never start a turn while the session is compacting. Pi runs
+	// auto-compaction from two places: after a turn (inside the agent run, so
+	// agent_settled has not fired yet) and *before* a submitted prompt, where
+	// `_isAgentRunActive` is false. In that second window agent_start/agent_settled
+	// say "idle" and sendMessage({triggerTurn}) goes straight to a fresh agent run,
+	// which then executes on the pre-compaction message array and clobbers the
+	// summary pi is still generating. Track compaction separately.
+	//
+	// Note: pi's compaction_start/compaction_end are UI events and are NOT delivered
+	// to extensions (see ExtensionEvent in core/extensions/types.d.ts). The only
+	// compaction hooks extensions get are session_before_compact (fires at the start
+	// of both manual and auto compaction, before the summarization request) and
+	// session_compact (fires on success only). Registering a session_before_compact
+	// handler is also what makes pi emit the event at all.
+	const COMPACTION_WEDGE_MS = 15 * 60 * 1000;
+
+	let agentBusy = false;
+	let compacting = false;
+	let compactingSince = 0;
+	// Set once a wake has been handed to sendMessage, cleared when the resulting turn
+	// starts or settles. Guards against a second dispatch racing in behind it.
+	//
+	// Known gap, deliberately not papered over: pi.sendMessage is fire-and-forget
+	// (bindCore wraps it in .catch), and drainMonitorBatch() has already destroyed the
+	// job's pending lines by the time it is called, so a send that rejects loses that
+	// batch. There is no delivery signal an extension can key on — agent_start does not
+	// fire for a steered message, and the harness has no way to observe the rejection —
+	// so any requeue heuristic resends on the normal path instead. Left as-is.
+	let sendPending = false;
 	const deferredWakes: DeferredWake[] = [];
+
+	function compactionWedged() {
+		return compacting && Date.now() - compactingSince > COMPACTION_WEDGE_MS;
+	}
+
+	function endCompaction() {
+		compacting = false;
+		compactingSince = 0;
+	}
+
 	pi.on("agent_start", () => {
-		busy = true;
+		agentBusy = true;
+		sendPending = false;
+		// Failsafe: compaction always finishes before the pre-prompt path starts a run.
+		endCompaction();
 	});
 	pi.on("agent_settled", () => {
-		busy = false;
+		agentBusy = false;
+		sendPending = false;
+		// Failsafe: post-turn auto-compaction always finishes before agent_settled.
+		endCompaction();
+		dispatchPendingWakes();
+	});
+
+	pi.on("session_before_compact", () => {
+		compacting = true;
+		compactingSince = Date.now();
+		// Returning undefined: do not cancel and do not supply extension compaction.
+		return undefined;
+	});
+	pi.on("session_compact", () => {
+		endCompaction();
 		dispatchPendingWakes();
 	});
 
@@ -169,23 +225,29 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function dispatchPendingWakes() {
-		if (busy) return;
-		const messages = deferredWakes.splice(0).map((entry) => entry.text);
+		if (agentBusy || sendPending) return;
+		// A cancelled or failed compaction emits no session_compact, so fall back to
+		// the wedge timeout rather than deferring wakes for the rest of the session.
+		if (compacting && !compactionWedged()) return;
+		endCompaction();
+
+		const batch = deferredWakes.splice(0);
 		for (const job of jobs.values()) {
 			if (job.kind !== "monitor") continue;
 			const message = drainMonitorBatch(job);
-			if (message) messages.push(message);
+			if (message) batch.push({ jobId: job.id, text: message });
 		}
-		if (messages.length === 0) return;
+		if (batch.length === 0) return;
 
-		busy = true;
+		sendPending = true;
 		try {
 			pi.sendMessage(
-				{ customType: "monitor", content: messages.join("\n\n"), display: true },
+				{ customType: "monitor", content: batch.map((entry) => entry.text).join("\n\n"), display: true },
 				{ triggerTurn: true },
 			);
 		} catch {
-			busy = false;
+			deferredWakes.unshift(...batch);
+			sendPending = false;
 		}
 	}
 

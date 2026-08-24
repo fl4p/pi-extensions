@@ -212,6 +212,40 @@ test("monitor holds busy output locally and releases one batch after agent_settl
 	}
 });
 
+test("monitor holds output while compaction is in flight and releases it after session_compact", async () => {
+	const { tools, handlers, messages } = createHarness();
+	const monitor = tools.get("monitor");
+	const stop = tools.get("background_stop");
+	// Pi's pre-prompt auto-compaction runs while the session looks idle: no
+	// agent_start has fired and agent_settled already has. Only session_before_compact
+	// marks the window, so a wake dispatched here would start a turn on the
+	// pre-compaction message array and clobber the summary being generated.
+	for (const handler of handlers.get("session_before_compact") ?? []) await handler();
+
+	const result = await monitor.execute(
+		"monitor",
+		{
+			command: `node -e "console.log('during-compaction'); setInterval(() => {}, 1000)"`,
+			description: "compaction-window",
+		},
+		undefined,
+		undefined,
+		{ cwd: process.cwd() },
+	);
+	try {
+		await waitFor(() => readFileSync(result.details.logpath, "utf8").includes("during-compaction"));
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		assert.deepEqual(messages, [], "no wake may be sent while compaction is in flight");
+
+		for (const handler of handlers.get("session_compact") ?? []) await handler();
+		assert.equal(messages.length, 1);
+		assert.match(messages[0], /during-compaction/);
+	} finally {
+		await stopAndWait(stop, result);
+		removeLog(result.details.logpath);
+	}
+});
+
 test("monitor completion waits for the active custom wake and does not repeat output", async () => {
 	const { tools, handlers, messages, userMessages } = createHarness();
 	const monitor = tools.get("monitor");
