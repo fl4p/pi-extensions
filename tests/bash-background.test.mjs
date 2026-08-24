@@ -5,11 +5,26 @@ import { join } from "node:path";
 import test from "node:test";
 import bashBackgroundExtension from "../extensions/bash-background.ts";
 
-function createHarness() {
+// Comfortably longer than the extension's PUMP_MS, so "nothing was dispatched"
+// assertions are not just racing the pump.
+const PUMP_SETTLE_MS = 900;
+
+function createHarness(options = {}) {
 	const tools = new Map();
 	const handlers = new Map();
 	const messages = [];
 	const userMessages = [];
+	// Number of upcoming triggerTurn sends that pi should reject. Models
+	// sendCustomMessage() rejecting (e.g. the core "Agent is already processing a
+	// prompt" guard): the send is fire-and-forget, so nothing throws at the call
+	// site and no message events are emitted, but _runAgentPrompt's finally still
+	// emits agent_settled.
+	let rejectSends = options.rejectSends ?? 0;
+
+	const emit = async (name, event) => {
+		for (const handler of handlers.get(name) ?? []) await handler(event);
+	};
+
 	const pi = {
 		registerTool(tool) {
 			tools.set(tool.name, tool);
@@ -19,15 +34,29 @@ function createHarness() {
 			entries.push(handler);
 			handlers.set(name, entries);
 		},
-		sendMessage(message) {
+		sendMessage(message, sendOptions) {
 			messages.push(message.content);
+			if (!sendOptions?.triggerTurn) return;
+			// Pi's runAgentLoop emits agent_start, then message_start/message_end for
+			// every prompt message (custom ones included), before the provider call.
+			// agent_settled is driven by the test, as pi drives it from the run's end.
+			void (async () => {
+				if (rejectSends > 0) {
+					rejectSends -= 1;
+					await emit("agent_settled");
+					return;
+				}
+				await emit("agent_start");
+				await emit("message_start", { message });
+				await emit("message_end", { message });
+			})();
 		},
 		sendUserMessage(message) {
 			userMessages.push(message);
 		},
 	};
 	bashBackgroundExtension(pi);
-	return { tools, handlers, messages, userMessages };
+	return { tools, handlers, messages, userMessages, emit };
 }
 
 async function waitFor(predicate, timeoutMs = 2000) {
@@ -212,15 +241,15 @@ test("monitor holds busy output locally and releases one batch after agent_settl
 	}
 });
 
-test("monitor holds output while compaction is in flight and releases it after session_compact", async () => {
-	const { tools, handlers, messages } = createHarness();
+test("no wake is dispatched anywhere inside a pre-prompt compaction, session_compact included", async () => {
+	const { tools, emit, messages } = createHarness();
 	const monitor = tools.get("monitor");
 	const stop = tools.get("background_stop");
-	// Pi's pre-prompt auto-compaction runs while the session looks idle: no
-	// agent_start has fired and agent_settled already has. Only session_before_compact
-	// marks the window, so a wake dispatched here would start a turn on the
-	// pre-compaction message array and clobber the summary being generated.
-	for (const handler of handlers.get("session_before_compact") ?? []) await handler();
+	// Pi's pre-prompt auto-compaction runs from inside prompt() (agent-session.js:865)
+	// with _isAgentRunActive still false, so agent_start/agent_settled both say "idle".
+	// input (:814) is the first extension-visible point of that call.
+	await emit("input");
+	await emit("session_before_compact");
 
 	const result = await monitor.execute(
 		"monitor",
@@ -237,11 +266,76 @@ test("monitor holds output while compaction is in flight and releases it after s
 		await new Promise((resolve) => setTimeout(resolve, 300));
 		assert.deepEqual(messages, [], "no wake may be sent while compaction is in flight");
 
-		for (const handler of handlers.get("session_compact") ?? []) await handler();
+		// session_compact fires at agent-session.js:1677 — still inside prompt(), before
+		// the original prompt reaches _runAgentPrompt at :919. Dispatching here would
+		// start a competing run and reproduce "Agent is already processing a prompt".
+		await emit("session_compact");
+		await new Promise((resolve) => setTimeout(resolve, PUMP_SETTLE_MS));
+		assert.deepEqual(messages, [], "session_compact still runs inside prompt(): must not dispatch");
+
+		// The original prompt now runs. Only once it settles is a wake safe.
+		await emit("agent_start");
+		await new Promise((resolve) => setTimeout(resolve, PUMP_SETTLE_MS));
+		assert.deepEqual(messages, [], "the prompt's own run is active");
+
+		await emit("agent_settled");
 		assert.equal(messages.length, 1);
 		assert.match(messages[0], /during-compaction/);
 	} finally {
 		await stopAndWait(stop, result);
+		removeLog(result.details.logpath);
+	}
+});
+
+test("a terminal wake held during compaction is pumped out, not stranded", async () => {
+	const { tools, emit, messages } = createHarness();
+	const background = tools.get("bash_background");
+	// A manual compaction while the session is idle: no input, and no agent_start or
+	// agent_settled will follow. A finite job clears its flush interval in finish(),
+	// so nothing but the pump can release its one terminal wake.
+	await emit("session_before_compact");
+
+	const result = await background.execute(
+		"bash_background",
+		{ command: `node -e "process.exit(3)"`, timeout: "30s", description: "stranded-exit" },
+		undefined,
+		undefined,
+		{ cwd: process.cwd() },
+	);
+	try {
+		await new Promise((resolve) => setTimeout(resolve, 400));
+		assert.deepEqual(messages, [], "the exit wake must be held while compacting");
+
+		await emit("session_compact");
+		// No further lifecycle event is emitted: only the pump can deliver this.
+		await waitFor(() => messages.length === 1, 3000);
+		assert.match(messages[0], /exited with code 3/);
+	} finally {
+		removeLog(result.details.logpath);
+	}
+});
+
+test("a rejected send is requeued and redelivered rather than dropped", async () => {
+	const { tools, emit, messages } = createHarness({ rejectSends: 1 });
+	const background = tools.get("bash_background");
+	const result = await background.execute(
+		"bash_background",
+		{ command: `node -e "process.exit(7)"`, timeout: "30s", description: "rejected-send" },
+		undefined,
+		undefined,
+		{ cwd: process.cwd() },
+	);
+	try {
+		// First dispatch is rejected: pi emits agent_settled with no message_end, so
+		// the batch is never acknowledged. drainMonitorBatch has already destroyed the
+		// job's copy, making the held batch the only one left.
+		await waitFor(() => messages.length >= 1, 3000);
+		assert.match(messages[0], /exited with code 7/);
+
+		// The requeue happens on that agent_settled; the pump carries it out.
+		await waitFor(() => messages.length === 2, 3000);
+		assert.match(messages[1], /exited with code 7/, "the wake must survive a rejected send");
+	} finally {
 		removeLog(result.details.logpath);
 	}
 });

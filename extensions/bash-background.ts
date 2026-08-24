@@ -144,68 +144,127 @@ export default function (pi: ExtensionAPI) {
 
 	type DeferredWake = { jobId: string; text: string };
 
-	// A wake must never start a turn while the session is compacting. Pi runs
-	// auto-compaction from two places: after a turn (inside the agent run, so
-	// agent_settled has not fired yet) and *before* a submitted prompt, where
-	// `_isAgentRunActive` is false. In that second window agent_start/agent_settled
-	// say "idle" and sendMessage({triggerTurn}) goes straight to a fresh agent run,
-	// which then executes on the pre-compaction message array and clobbers the
-	// summary pi is still generating. Track compaction separately.
+	// A wake must never start a turn while pi is inside prompt() or compacting.
+	//
+	// Pi runs auto-compaction from two places. The post-turn path sits inside the
+	// agent run, so agent_settled has not fired yet and agent_start/agent_settled
+	// already covered it. The pre-prompt path runs from inside prompt()
+	// (agent-session.js:865, before _runAgentPrompt at :919) with
+	// `_isAgentRunActive` still false, so isStreaming and isIdle both report idle and
+	// sendMessage({triggerTurn}) goes straight to a fresh agent run — which then
+	// executes on the pre-compaction message array and discards the summary pi is
+	// still generating, and collides with the original prompt when it resumes.
+	//
+	// The suppression window therefore has to be the whole of prompt(), not just the
+	// compaction inside it. `input` (agent-session.js:814) is the earliest
+	// extension-visible point in prompt(); `session_compact` fires at :1677, still
+	// inside it, so dispatching from that handler recreates the same race one step
+	// later. Nothing dispatches until agent_start or agent_settled.
 	//
 	// Note: pi's compaction_start/compaction_end are UI events and are NOT delivered
-	// to extensions (see ExtensionEvent in core/extensions/types.d.ts). The only
-	// compaction hooks extensions get are session_before_compact (fires at the start
-	// of both manual and auto compaction, before the summarization request) and
-	// session_compact (fires on success only). Registering a session_before_compact
-	// handler is also what makes pi emit the event at all.
-	const COMPACTION_WEDGE_MS = 15 * 60 * 1000;
+	// to extensions (see ExtensionEvent in core/extensions/types.d.ts:774). The only
+	// compaction hooks extensions get are session_before_compact (start of both manual
+	// and auto compaction) and session_compact (success only). Registering a
+	// session_before_compact handler is also what makes pi emit the event at all.
+	//
+	// The gate is released by events, not by elapsed time. GATE_MAX_MS exists only for
+	// the one case with no closing event at all — a manual compaction that fails or is
+	// cancelled while the session is otherwise idle — and is deliberately far above any
+	// real compaction (a 270k-token summary took ~105 s, and pi can issue two sequential
+	// summarization calls, each retryable, so there is no tight upper bound to target).
+	const GATE_MAX_MS = 30 * 60 * 1000;
+	// Finite jobs clear their flush interval in finish(), so a terminal wake declined
+	// while the gate is shut has no timer of its own to retry it. Pump it actively.
+	const PUMP_MS = 500;
 
 	let agentBusy = false;
+	let promptPending = false;
 	let compacting = false;
-	let compactingSince = 0;
-	// Set once a wake has been handed to sendMessage, cleared when the resulting turn
-	// starts or settles. Guards against a second dispatch racing in behind it.
-	//
-	// Known gap, deliberately not papered over: pi.sendMessage is fire-and-forget
-	// (bindCore wraps it in .catch), and drainMonitorBatch() has already destroyed the
-	// job's pending lines by the time it is called, so a send that rejects loses that
-	// batch. There is no delivery signal an extension can key on — agent_start does not
-	// fire for a steered message, and the harness has no way to observe the rejection —
-	// so any requeue heuristic resends on the normal path instead. Left as-is.
-	let sendPending = false;
+	let gateSince = 0;
+	let pumpTimer: ReturnType<typeof setTimeout> | undefined;
+
+	// A wake batch handed to sendMessage, held until pi acknowledges it. sendMessage is
+	// fire-and-forget (bindCore wraps it in .catch) and drainMonitorBatch() has already
+	// destroyed the job's pending lines, so this is the only copy. The acknowledgement
+	// is the message_end pi emits for each prompt message (agent-loop.js runAgentLoop),
+	// matched on our own wakeId — agent_start is not usable for this, since it fires
+	// before the message events and not at all for a steered message.
+	let inFlight: DeferredWake[] = [];
+	let inFlightId: string | undefined;
 	const deferredWakes: DeferredWake[] = [];
 
-	function compactionWedged() {
-		return compacting && Date.now() - compactingSince > COMPACTION_WEDGE_MS;
+	function gateShut() {
+		if (agentBusy || inFlightId !== undefined) return true;
+		if (!promptPending && !compacting) return false;
+		if (Date.now() - gateSince > GATE_MAX_MS) {
+			openGate();
+			return false;
+		}
+		return true;
 	}
 
-	function endCompaction() {
-		compacting = false;
-		compactingSince = 0;
+	function shutGate() {
+		if (!promptPending && !compacting) gateSince = Date.now();
 	}
+
+	function openGate() {
+		promptPending = false;
+		compacting = false;
+		gateSince = 0;
+	}
+
+	function armPump() {
+		if (pumpTimer !== undefined) return;
+		pumpTimer = setTimeout(() => {
+			pumpTimer = undefined;
+			dispatchPendingWakes();
+		}, PUMP_MS);
+		pumpTimer.unref?.();
+	}
+
+	// A prompt submission is in flight from here until the run starts or the call
+	// bails out. Returning undefined leaves the input untouched (runner.emitInput
+	// only acts on action "handled"/"transform").
+	pi.on("input", () => {
+		shutGate();
+		promptPending = true;
+		return undefined;
+	});
+	pi.on("session_before_compact", () => {
+		shutGate();
+		compacting = true;
+		return undefined;
+	});
+	// Deliberately does NOT dispatch: session_compact still runs inside prompt().
+	pi.on("session_compact", () => {
+		compacting = false;
+	});
 
 	pi.on("agent_start", () => {
 		agentBusy = true;
-		sendPending = false;
-		// Failsafe: compaction always finishes before the pre-prompt path starts a run.
-		endCompaction();
+		openGate();
+	});
+	// Pi emits message_end for every prompt message before the provider call, custom
+	// messages included, so this is a true delivery acknowledgement.
+	pi.on("message_end", (event) => {
+		const message = event.message as { customType?: string; details?: { wakeId?: string } };
+		if (inFlightId !== undefined && message?.customType === "monitor" && message.details?.wakeId === inFlightId) {
+			inFlight = [];
+			inFlightId = undefined;
+		}
+		return undefined;
 	});
 	pi.on("agent_settled", () => {
 		agentBusy = false;
-		sendPending = false;
-		// Failsafe: post-turn auto-compaction always finishes before agent_settled.
-		endCompaction();
-		dispatchPendingWakes();
-	});
-
-	pi.on("session_before_compact", () => {
-		compacting = true;
-		compactingSince = Date.now();
-		// Returning undefined: do not cancel and do not supply extension compaction.
-		return undefined;
-	});
-	pi.on("session_compact", () => {
-		endCompaction();
+		openGate();
+		if (inFlightId !== undefined) {
+			// The run ended without ever acknowledging our message: the send rejected.
+			// Requeue rather than drop it — a lost job-exit wake leaves the agent
+			// waiting forever on a job that already finished.
+			deferredWakes.unshift(...inFlight);
+			inFlight = [];
+			inFlightId = undefined;
+		}
 		dispatchPendingWakes();
 	});
 
@@ -224,12 +283,21 @@ export default function (pi: ExtensionAPI) {
 		return `[monitor:${job.description}] (${job.id}) new output:\n${body}${note}`;
 	}
 
+	function hasPendingWork() {
+		if (deferredWakes.length > 0) return true;
+		for (const job of jobs.values()) {
+			if (job.kind !== "monitor" || job.stopped || job.done) continue;
+			if (job.pending!.length > 0 || job.truncated) return true;
+		}
+		return false;
+	}
+
 	function dispatchPendingWakes() {
-		if (agentBusy || sendPending) return;
-		// A cancelled or failed compaction emits no session_compact, so fall back to
-		// the wedge timeout rather than deferring wakes for the rest of the session.
-		if (compacting && !compactionWedged()) return;
-		endCompaction();
+		if (gateShut()) {
+			// Keep retrying: a terminal wake from a finite job has no timer of its own.
+			if (hasPendingWork()) armPump();
+			return;
+		}
 
 		const batch = deferredWakes.splice(0);
 		for (const job of jobs.values()) {
@@ -239,15 +307,26 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (batch.length === 0) return;
 
-		sendPending = true;
+		const wakeId = randomUUID();
+		inFlight = batch;
+		inFlightId = wakeId;
 		try {
 			pi.sendMessage(
-				{ customType: "monitor", content: batch.map((entry) => entry.text).join("\n\n"), display: true },
+				{
+					customType: "monitor",
+					content: batch.map((entry) => entry.text).join("\n\n"),
+					display: true,
+					details: { wakeId },
+				},
 				{ triggerTurn: true },
 			);
 		} catch {
+			// Synchronous throw. An async rejection instead shows up as a missing
+			// message_end and is requeued at agent_settled.
 			deferredWakes.unshift(...batch);
-			sendPending = false;
+			inFlight = [];
+			inFlightId = undefined;
+			armPump();
 		}
 	}
 
