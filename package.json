@@ -10,6 +10,7 @@
   },
   "pi": {
     "extensions": [
+      "./extensions/account-mux.ts",
       "./extensions/bash-background.ts",
       "./extensions/bash-duration.ts",
       "./extensions/google-search.ts",

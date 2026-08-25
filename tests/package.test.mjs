@@ -5,6 +5,7 @@ import test from "node:test";
 test("every packaged extension imports successfully", async () => {
 	const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 	assert.deepEqual(pkg.pi.extensions, [
+		"./extensions/account-mux.ts",
 		"./extensions/bash-background.ts",
 		"./extensions/bash-duration.ts",
 		"./extensions/google-search.ts",

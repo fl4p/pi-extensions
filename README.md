@@ -4,6 +4,35 @@ Personal extensions for [pi](https://github.com/earendil-works/pi-coding-agent),
 
 ## Extensions
 
+### account-mux
+
+Switch the `anthropic` provider between multiple accounts without re-running `/login`.
+
+Named credential profiles live in `~/.pi/agent/auth-profiles.json`; a switch swaps the `anthropic` entry of `~/.pi/agent/auth.json`. Pi re-reads `auth.json` when its file revision changes, so switches take effect immediately, even in running sessions. The active profile is shown in the status bar (`⇄ name`).
+
+| Command | What it does |
+|---------|--------------|
+| `/account` | Pick a profile to switch to. |
+| `/account <name>` | Switch directly (tab-completes). |
+| `/account save <name>` | Snapshot the current `auth.json` credential as a profile and mark it active. |
+| `/account remove <name>` | Delete a stored profile. |
+| `/account list` | List profiles with emails; marks the active one. |
+| `/account whoami` | Ask the Anthropic API which account the live token belongs to. |
+
+Safeguards, all of which exist because OAuth tokens rotate on refresh and several pi sessions share one `auth.json`:
+
+- Switching syncs the live (possibly rotated) credential back into the profile it belongs to first, guarded by an identity check against `api.anthropic.com/api/oauth/profile` so a foreign credential is never written into the wrong profile. A foreign credential whose account matches another stored profile is synced into that profile instead.
+- Writes cooperate with pi's `auth.json.lock` so a switch cannot race a concurrent OAuth refresh.
+- A file watcher detects when another process overwrites `auth.json` with a different account — long-running pi sessions started under the old account do this — warns (`⇄ name ⚠ other@email`), and keeps known-profile credentials fresh. Re-assert with `/account <name>`, or restart the stale sessions.
+
+#### Install
+
+```bash
+ln -s /path/to/pi-extensions/extensions/account-mux.ts ~/.pi/agent/extensions/account-mux.ts
+```
+
+Then restart pi (or `/reload`). Bootstrap by logging into each account via `/login` and running `/account save <name>` after each.
+
 ### bash-background
 
 Run shell commands detached and wake the agent when they produce output or finish.

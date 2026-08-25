@@ -1,0 +1,116 @@
+import assert from "node:assert/strict";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import { performSave, performSwitch } from "../extensions/account-mux.ts";
+
+const dir = mkdtempSync(join(tmpdir(), "account-mux-"));
+process.env.PI_CODING_AGENT_DIR = dir;
+test.after(() => rmSync(dir, { recursive: true, force: true }));
+
+// Expired tokens keep credentialLooksLive() false, so no identity-check network calls run.
+const credA = { type: "oauth", access: "A1", refresh: "RA1", expires: 1000 };
+const credB = { type: "oauth", access: "B1", refresh: "RB1", expires: 1000 };
+
+const authPath = join(dir, "auth.json");
+const storePath = join(dir, "auth-profiles.json");
+const readAuth = () => JSON.parse(readFileSync(authPath, "utf-8"));
+const readStore = () => JSON.parse(readFileSync(storePath, "utf-8"));
+
+function seed() {
+	writeFileSync(authPath, JSON.stringify({ anthropic: credA, openai: { type: "api_key", key: "K" } }));
+	writeFileSync(
+		storePath,
+		JSON.stringify({
+			anthropic: {
+				active: "alpha",
+				profiles: {
+					alpha: { email: "a@example.com", credential: credA, savedAt: 1 },
+					beta: { email: "b@example.com", credential: credB, savedAt: 1 },
+				},
+			},
+		}),
+	);
+}
+
+test("switch swaps the anthropic credential and preserves other providers", async () => {
+	seed();
+	await performSwitch("beta");
+	assert.deepEqual(readAuth().anthropic, credB);
+	assert.equal(readStore().anthropic.active, "beta");
+	assert.equal(readAuth().openai.key, "K");
+	assert.ok(!existsSync(`${authPath}.lock`));
+});
+
+test("rotated tokens are synced back into the profile they belong to", async () => {
+	seed();
+	await performSwitch("beta");
+	const rotated = { type: "oauth", access: "B2", refresh: "RB2", expires: 2000 };
+	const auth = readAuth();
+	auth.anthropic = rotated;
+	writeFileSync(authPath, JSON.stringify(auth));
+
+	await performSwitch("alpha");
+	assert.deepEqual(readAuth().anthropic, credA);
+	assert.deepEqual(readStore().anthropic.profiles.beta.credential, rotated);
+});
+
+test("a stale auth.json.lock is reclaimed", async () => {
+	seed();
+	mkdirSync(`${authPath}.lock`);
+	const old = new Date(Date.now() - 60_000);
+	utimesSync(`${authPath}.lock`, old, old);
+
+	await performSwitch("beta");
+	assert.deepEqual(readAuth().anthropic, credB);
+	assert.ok(!existsSync(`${authPath}.lock`));
+});
+
+test("switching to an unknown profile throws and leaves auth.json untouched", async () => {
+	seed();
+	await assert.rejects(() => performSwitch("nope"), /No profile "nope"/);
+	assert.deepEqual(readAuth().anthropic, credA);
+	assert.equal(readStore().anthropic.active, "alpha");
+});
+
+test("save snapshots the current credential and marks it active", async () => {
+	seed();
+	const auth = readAuth();
+	auth.anthropic = { type: "oauth", access: "C1", refresh: "RC1", expires: 1000 };
+	writeFileSync(authPath, JSON.stringify(auth));
+
+	const profile = await performSave("gamma");
+	assert.equal(profile.credential.access, "C1");
+	const store = readStore().anthropic;
+	assert.equal(store.active, "gamma");
+	assert.deepEqual(store.profiles.gamma.credential, auth.anthropic);
+	assert.deepEqual(store.profiles.alpha.credential, credA);
+});
+
+test("save rejects invalid profile names", async () => {
+	seed();
+	await assert.rejects(() => performSave("bad name"), /Invalid profile name/);
+});
+
+test("a foreign credential with a known owner is synced into that profile, not the active one", async () => {
+	seed();
+	// live-looking rotated credential belonging to beta, written by a stale session while alpha is active
+	const rotatedB = { type: "oauth", access: "B9", refresh: "RB9", expires: Date.now() + 3_600_000 };
+	const auth = readAuth();
+	auth.anthropic = rotatedB;
+	writeFileSync(authPath, JSON.stringify(auth));
+
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () =>
+		new Response(JSON.stringify({ account: { email: "b@example.com", uuid: "u-b" } }), { status: 200 });
+	try {
+		const { warning } = await performSwitch("beta");
+		assert.match(warning, /synced it into profile "beta"/);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+	assert.deepEqual(readAuth().anthropic, rotatedB);
+	assert.deepEqual(readStore().anthropic.profiles.beta.credential, rotatedB);
+	assert.deepEqual(readStore().anthropic.profiles.alpha.credential, credA);
+});
