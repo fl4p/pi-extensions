@@ -106,6 +106,11 @@ function credentialLooksLive(cred: Credential): boolean {
 	return cred.type === "oauth" && typeof cred.expires === "number" && cred.expires > Date.now() + 5000;
 }
 
+function keyPrefix(cred: Credential): string {
+	if (cred.type === "api_key" && typeof cred.key === "string") return `sk-ant-…${cred.key.slice(-4)}`;
+	return "";
+}
+
 // Other pi processes started under a different account can write their cached
 // credential back over auth.json (observed live: a stale session restored the
 // previous account's token twice). Suppress reactions to our own writes.
@@ -173,6 +178,17 @@ export async function performSave(name: string): Promise<Profile> {
 	}
 	ps.profiles[name] = prof;
 	ps.active = name;
+	writeJson(storePath(), store);
+	return prof;
+}
+
+export async function performAddKey(name: string, key: string): Promise<Profile> {
+	if (!NAME_RE.test(name)) throw new Error(`Invalid profile name "${name}" (use letters, digits, . _ -)`);
+	if (!/^sk-ant-/i.test(key)) throw new Error("Key doesn't look like an Anthropic API key (expected sk-ant-...).");
+	const store = readStore();
+	const ps = (store[PROVIDER] ??= { profiles: {} });
+	const prof: Profile = { credential: { type: "api_key", key }, savedAt: Date.now() };
+	ps.profiles[name] = prof;
 	writeJson(storePath(), store);
 	return prof;
 }
@@ -263,14 +279,14 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("account", {
-		description: `Switch ${PROVIDER} account (multiplexer): /account [name|save <name>|remove <name>|list|whoami]`,
+		description: `Switch ${PROVIDER} account (multiplexer): /account [name|add <name>|save <name>|remove <name>|list|whoami]`,
 		getArgumentCompletions: (prefix: string) => {
 			const words = prefix.split(/\s+/);
 			const store = readStore()[PROVIDER];
 			const names = Object.keys(store?.profiles ?? {});
 			let candidates: string[];
 			if (words.length <= 1) {
-				candidates = [...names, "save", "remove", "list", "whoami"].filter((c) => c.startsWith(words[0] ?? ""));
+				candidates = [...names, "add", "save", "remove", "list", "whoami"].filter((c) => c.startsWith(words[0] ?? ""));
 			} else if (words[0] === "remove") {
 				candidates = names.filter((n) => n.startsWith(words[1])).map((n) => `remove ${n}`);
 			} else {
@@ -289,6 +305,7 @@ export default function (pi: ExtensionAPI) {
 				const parts = [name];
 				if (name === store?.active) parts.push("(active)");
 				if (p?.email) parts.push(`— ${p.email}`);
+				else if (p && p.credential.type === "api_key") parts.push(`— API key ${keyPrefix(p.credential)}`);
 				return parts.join(" ");
 			};
 
@@ -296,7 +313,8 @@ export default function (pi: ExtensionAPI) {
 				try {
 					const { profile, warning } = await performSwitch(name);
 					if (warning) ctx.ui.notify(warning, "warning");
-					ctx.ui.notify(`${PROVIDER} → ${name}${profile.email ? ` (${profile.email})` : ""}`, "info");
+					const tag = profile.email ?? (profile.credential.type === "api_key" ? `API key ${keyPrefix(profile.credential)}` : "");
+					ctx.ui.notify(`${PROVIDER} → ${name}${tag ? ` (${tag})` : ""}`, "info");
 					updateStatus(ctx);
 				} catch (e: any) {
 					ctx.ui.notify(e.message ?? String(e), "error");
@@ -325,7 +343,7 @@ export default function (pi: ExtensionAPI) {
 				case "whoami": {
 					const current = (readJson(authPath()) ?? {})[PROVIDER] as Credential | undefined;
 					if (!current) return ctx.ui.notify(`No ${PROVIDER} credential in auth.json.`, "error");
-					if (current.type !== "oauth") return ctx.ui.notify(`Current ${PROVIDER} credential is an API key.`, "info");
+					if (current.type !== "oauth") return ctx.ui.notify(`Current ${PROVIDER} credential is an API key ${keyPrefix(current)}.`, "info");
 					const id = await whois(String(current.access));
 					ctx.ui.notify(id?.email ? `${id.email}` : "Could not identify token (expired or offline).", "info");
 					return;
@@ -338,6 +356,30 @@ export default function (pi: ExtensionAPI) {
 						updateStatus(ctx);
 					} catch (e: any) {
 						ctx.ui.notify(e.message ?? String(e), "error");
+					}
+					return;
+				}
+				case "add": {
+					if (!argv[1]) return ctx.ui.notify("Usage: /account add <name>", "error");
+					if (!ctx.hasUI) return;
+					const key = (await ctx.ui.input(`Paste Anthropic API key for "${argv[1]}":`, "sk-ant-..."))?.trim();
+					if (!key) return ctx.ui.notify("Cancelled.", "info");
+					try {
+						await performAddKey(argv[1], key);
+					} catch (e: any) {
+						return ctx.ui.notify(e.message ?? String(e), "error");
+					}
+					try {
+						const { profile } = await performSwitch(argv[1]);
+						const tag = profile.email ?? (profile.credential.type === "api_key" ? `API key ${keyPrefix(profile.credential)}` : "");
+						ctx.ui.notify(`${PROVIDER} → ${argv[1]}${tag ? ` (${tag})` : ""}`, "info");
+						updateStatus(ctx);
+					} catch (e: any) {
+						ctx.ui.notify(
+							`Saved "${argv[1]}" but couldn't switch: ${e.message ?? e}. ` +
+								"(auth.json frozen? run: chflags nouchg ~/.pi/agent/auth.json)",
+							"warning",
+						);
 					}
 					return;
 				}

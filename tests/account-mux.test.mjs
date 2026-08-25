@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, w
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { performSave, performSwitch } from "../extensions/account-mux.ts";
+import { performAddKey, performSave, performSwitch } from "../extensions/account-mux.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "account-mux-"));
 process.env.PI_CODING_AGENT_DIR = dir;
@@ -91,6 +91,33 @@ test("save snapshots the current credential and marks it active", async () => {
 test("save rejects invalid profile names", async () => {
 	seed();
 	await assert.rejects(() => performSave("bad name"), /Invalid profile name/);
+});
+
+test("performAddKey stores an api_key profile without touching auth.json", async () => {
+	seed();
+	const prof = await performAddKey("workapi", "sk-ant-api03-XYZW1234");
+	assert.equal(prof.credential.type, "api_key");
+	assert.equal(readStore().anthropic.profiles.workapi.credential.key, "sk-ant-api03-XYZW1234");
+	// active unchanged and auth.json untouched until an explicit switch
+	assert.equal(readStore().anthropic.active, "alpha");
+	assert.deepEqual(readAuth().anthropic, credA);
+});
+
+test("switching to an api_key profile swaps auth.json and preserves other providers", async () => {
+	seed();
+	await performAddKey("workapi", "sk-ant-api03-XYZW1234");
+	await performSwitch("workapi");
+	assert.equal(readAuth().anthropic.type, "api_key");
+	assert.equal(readAuth().anthropic.key, "sk-ant-api03-XYZW1234");
+	assert.equal(readAuth().openai.key, "K");
+	assert.equal(readStore().anthropic.active, "workapi");
+	assert.ok(!existsSync(`${authPath}.lock`));
+});
+
+test("performAddKey rejects non-Anthropic keys and bad names", async () => {
+	seed();
+	await assert.rejects(() => performAddKey("bad", "not-an-anthropic-key"), /Anthropic API key/);
+	await assert.rejects(() => performAddKey("bad name", "sk-ant-x"), /Invalid profile name/);
 });
 
 test("a foreign credential with a known owner is synced into that profile, not the active one", async () => {

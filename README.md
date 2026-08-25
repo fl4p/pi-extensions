@@ -15,6 +15,7 @@ Named credential profiles live in `~/.pi/agent/auth-profiles.json`; a switch swa
 | `/account` | Pick a profile to switch to. |
 | `/account <name>` | Switch directly (tab-completes). |
 | `/account save <name>` | Snapshot the current `auth.json` credential as a profile and mark it active. |
+| `/account add <name>` | Prompt for an Anthropic API key and store it as a profile (then switch to it). |
 | `/account remove <name>` | Delete a stored profile. |
 | `/account list` | List profiles with emails; marks the active one. |
 | `/account whoami` | Ask the Anthropic API which account the live token belongs to. |
@@ -31,7 +32,7 @@ Safeguards, all of which exist because OAuth tokens rotate on refresh and severa
 ln -s /path/to/pi-extensions/extensions/account-mux.ts ~/.pi/agent/extensions/account-mux.ts
 ```
 
-Then restart pi (or `/reload`). Bootstrap by logging into each account via `/login` and running `/account save <name>` after each.
+Then restart pi (or `/reload`). Bootstrap by logging into each account via `/login` and running `/account save <name>` after each, or `/account add <name>` to register an API key profile without `/login`.
 
 ### bash-background
 
