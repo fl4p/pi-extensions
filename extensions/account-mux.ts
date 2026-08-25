@@ -1,18 +1,22 @@
 /**
- * Account multiplexer for the anthropic provider.
+ * Account multiplexer for pi's auth.json providers.
  *
- * Keeps named credential profiles in ~/.pi/agent/auth-profiles.json and swaps
- * the `anthropic` entry of auth.json between them. Pi re-reads auth.json when
- * its file revision changes, so a switch takes effect immediately, even in a
- * running session.
+ * Named credential profiles live in ~/.pi/agent/auth-profiles.json, keyed by
+ * provider. A switch swaps that provider's entry in ~/.pi/agent/auth.json. Pi
+ * re-reads auth.json when its file revision changes, so a switch takes effect
+ * immediately, even in a running session.
  *
- * Commands:
- *	 /account							 picker (select profile to switch to)
- *	 /account <name>			 switch directly
- *	 /account save <name>	 snapshot current auth.json credential as a profile
- *	 /account remove <name>
- *	 /account list
- *	 /account whoami			 ask the API who the current token belongs to
+ * Commands (provider defaults to "anthropic"):
+ *	 /account												picker (all profiles, all providers)
+ *	 /account <name> [provider]			switch directly (searches all providers if omitted)
+ *	 /account add <name> [provider]	 prompt for an API key, store + switch
+ *	 /account save <name> [provider]	snapshot current auth.json credential
+ *	 /account remove <name> [provider]
+ *	 /account list [provider]
+ *	 /account whoami [provider]				ask the API who the current anthropic token belongs to
+ *
+ * The oauth-rotation sync-back and the foreign-clobber watcher are
+ * anthropic-specific; api_key profiles for other providers need neither.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { mkdirSync, readFileSync, rmdirSync, statSync, watch, writeFileSync, type FSWatcher } from "node:fs";
@@ -21,6 +25,7 @@ import { join } from "node:path";
 
 const PROVIDER = "anthropic";
 const NAME_RE = /^[A-Za-z0-9._-]+$/;
+const MIN_KEY_LEN = 16;
 
 type Credential = Record<string, unknown> & { type: string };
 interface Profile {
@@ -88,6 +93,7 @@ async function withAuthLock<T>(fn: () => Promise<T> | T): Promise<T> {
 	}
 }
 
+// Identity check is anthropic OAuth only.
 async function whois(access: string, timeoutMs = 3000): Promise<{ email?: string; uuid?: string } | undefined> {
 	try {
 		const res = await fetch("https://api.anthropic.com/api/oauth/profile", {
@@ -107,7 +113,7 @@ function credentialLooksLive(cred: Credential): boolean {
 }
 
 function keyPrefix(cred: Credential): string {
-	if (cred.type === "api_key" && typeof cred.key === "string") return `sk-ant-…${cred.key.slice(-4)}`;
+	if (cred.type === "api_key" && typeof cred.key === "string") return `…${cred.key.slice(-4)}`;
 	return "";
 }
 
@@ -116,26 +122,26 @@ function keyPrefix(cred: Credential): string {
 // previous account's token twice). Suppress reactions to our own writes.
 let selfWriteUntil = 0;
 
-export async function performSwitch(name: string): Promise<{ profile: Profile; warning?: string }> {
+export async function performSwitch(name: string, provider = PROVIDER): Promise<{ profile: Profile; warning?: string }> {
 	const store = readStore();
-	const ps = store[PROVIDER];
+	const ps = store[provider];
 	const target = ps?.profiles?.[name];
 	if (!ps || !target) {
-		throw new Error(`No profile "${name}" for ${PROVIDER}. Save one with /account save <name>.`);
+		throw new Error(`No profile "${name}" for ${provider}. Save one with /account save ${name} ${provider}.`);
 	}
 	let warning: string | undefined;
 
 	selfWriteUntil = Date.now() + 2000;
 	await withAuthLock(async () => {
 		const auth = readJson(authPath()) ?? {};
-		const current = auth[PROVIDER] as Credential | undefined;
+		const current = auth[provider] as Credential | undefined;
 
 		// Tokens rotate on refresh: write the (possibly rotated) live credential
 		// back into the profile it belongs to before overwriting auth.json.
 		const activeProfile = ps.active ? ps.profiles[ps.active] : undefined;
 		if (current && activeProfile && JSON.stringify(activeProfile.credential) !== JSON.stringify(current)) {
 			let owner: Profile | undefined = activeProfile;
-			if (credentialLooksLive(current) && activeProfile.email) {
+			if (provider === PROVIDER && credentialLooksLive(current) && activeProfile.email) {
 				const id = await whois(String(current.access));
 				if (id?.email && id.email !== activeProfile.email) {
 					// Foreign credential (stale session write-back or external /login):
@@ -145,7 +151,7 @@ export async function performSwitch(name: string): Promise<{ profile: Profile; w
 					warning = entry
 						? `auth.json held a credential for ${id.email} — synced it into profile "${entry[0]}" instead of "${ps.active}".`
 						: `auth.json held a credential for ${id.email} (no matching profile) — discarded. ` +
-							`Use /account save <name> to keep such logins.`;
+							`Use /account save ${name} ${provider} to keep such logins.`;
 				}
 			}
 			if (owner) {
@@ -154,7 +160,7 @@ export async function performSwitch(name: string): Promise<{ profile: Profile; w
 			}
 		}
 
-		auth[PROVIDER] = target.credential;
+		auth[provider] = target.credential;
 		writeJson(authPath(), auth);
 	});
 
@@ -163,16 +169,16 @@ export async function performSwitch(name: string): Promise<{ profile: Profile; w
 	return { profile: target, warning };
 }
 
-export async function performSave(name: string): Promise<Profile> {
+export async function performSave(name: string, provider = PROVIDER): Promise<Profile> {
 	if (!NAME_RE.test(name)) throw new Error(`Invalid profile name "${name}" (use letters, digits, . _ -)`);
 	const auth = readJson(authPath()) ?? {};
-	const current = auth[PROVIDER] as Credential | undefined;
-	if (!current) throw new Error(`No ${PROVIDER} credential in auth.json to save.`);
+	const current = auth[provider] as Credential | undefined;
+	if (!current) throw new Error(`No ${provider} credential in auth.json to save.`);
 
 	const store = readStore();
-	const ps = (store[PROVIDER] ??= { profiles: {} });
+	const ps = (store[provider] ??= { profiles: {} });
 	const prof: Profile = { ...ps.profiles[name], credential: current, savedAt: Date.now() };
-	if (credentialLooksLive(current)) {
+	if (provider === PROVIDER && credentialLooksLive(current)) {
 		const id = await whois(String(current.access));
 		if (id?.email) prof.email = id.email;
 	}
@@ -182,15 +188,25 @@ export async function performSave(name: string): Promise<Profile> {
 	return prof;
 }
 
-export async function performAddKey(name: string, key: string): Promise<Profile> {
+export async function performAddKey(name: string, key: string, provider = PROVIDER): Promise<Profile> {
 	if (!NAME_RE.test(name)) throw new Error(`Invalid profile name "${name}" (use letters, digits, . _ -)`);
-	if (!/^sk-ant-/i.test(key)) throw new Error("Key doesn't look like an Anthropic API key (expected sk-ant-...).");
+	const trimmed = (key ?? "").trim();
+	if (trimmed.length < MIN_KEY_LEN) throw new Error(`Key too short (min ${MIN_KEY_LEN} chars).`);
 	const store = readStore();
-	const ps = (store[PROVIDER] ??= { profiles: {} });
-	const prof: Profile = { credential: { type: "api_key", key }, savedAt: Date.now() };
+	const ps = (store[provider] ??= { profiles: {} });
+	const prof: Profile = { credential: { type: "api_key", key: trimmed }, savedAt: Date.now() };
 	ps.profiles[name] = prof;
 	writeJson(storePath(), store);
 	return prof;
+}
+
+export function findProfiles(name: string): Array<{ provider: string; profile: Profile }> {
+	const store = readStore();
+	const out: Array<{ provider: string; profile: Profile }> = [];
+	for (const [provider, ps] of Object.entries(store)) {
+		if (ps.profiles[name]) out.push({ provider, profile: ps.profiles[name] });
+	}
+	return out;
 }
 
 type UiLike = {
@@ -278,17 +294,21 @@ export default function (pi: ExtensionAPI) {
 		ui = undefined;
 	});
 
+	const SUBCOMMANDS = ["add", "save", "remove", "list", "whoami"];
+
 	pi.registerCommand("account", {
-		description: `Switch ${PROVIDER} account (multiplexer): /account [name|add <name>|save <name>|remove <name>|list|whoami]`,
+		description: `Switch auth.json providers (multiplexer): /account [name|add <name> [provider]|save <name> [provider]|remove <name> [provider]|list [provider]|whoami [provider]]`,
 		getArgumentCompletions: (prefix: string) => {
 			const words = prefix.split(/\s+/);
-			const store = readStore()[PROVIDER];
-			const names = Object.keys(store?.profiles ?? {});
+			const store = readStore();
+			const allNames = new Set<string>();
+			for (const ps of Object.values(store)) for (const n of Object.keys(ps.profiles)) allNames.add(n);
+			const names = [...allNames];
 			let candidates: string[];
 			if (words.length <= 1) {
-				candidates = [...names, "add", "save", "remove", "list", "whoami"].filter((c) => c.startsWith(words[0] ?? ""));
-			} else if (words[0] === "remove") {
-				candidates = names.filter((n) => n.startsWith(words[1])).map((n) => `remove ${n}`);
+				candidates = [...names, ...SUBCOMMANDS].filter((c) => c.startsWith(words[0] ?? ""));
+			} else if (words[0] === "remove" || words[0] === "add" || words[0] === "save") {
+				candidates = names.filter((n) => n.startsWith(words[1])).map((n) => `${words[0]} ${n}`);
 			} else {
 				return null;
 			}
@@ -297,24 +317,34 @@ export default function (pi: ExtensionAPI) {
 		},
 		handler: async (args, ctx) => {
 			const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
-			const store = readStore()[PROVIDER];
-			const profiles = store?.profiles ?? {};
+			const store = readStore();
 
-			const describe = (name: string) => {
-				const p = profiles[name];
-				const parts = [name];
-				if (name === store?.active) parts.push("(active)");
+			const describe = (name: string, provider: string) => {
+				const p = store[provider]?.profiles?.[name];
+				const parts = provider === PROVIDER ? [name] : [`${provider}/${name}`];
+				if (name === store[provider]?.active) parts.push("(active)");
 				if (p?.email) parts.push(`— ${p.email}`);
 				else if (p && p.credential.type === "api_key") parts.push(`— API key ${keyPrefix(p.credential)}`);
 				return parts.join(" ");
 			};
 
-			const doSwitch = async (name: string) => {
+			const doSwitch = async (name: string, provider?: string) => {
 				try {
-					const { profile, warning } = await performSwitch(name);
+					let prov = provider;
+					if (!prov) {
+						const matches = findProfiles(name);
+						if (matches.length === 0) throw new Error(`No profile "${name}". Try /account list.`);
+						if (matches.length > 1)
+							throw new Error(
+								`Profile "${name}" exists for multiple providers: ${matches.map((m) => m.provider).join(", ")}. ` +
+									`Use /account ${name} <provider>.`,
+							);
+						prov = matches[0].provider;
+					}
+					const { profile, warning } = await performSwitch(name, prov);
 					if (warning) ctx.ui.notify(warning, "warning");
 					const tag = profile.email ?? (profile.credential.type === "api_key" ? `API key ${keyPrefix(profile.credential)}` : "");
-					ctx.ui.notify(`${PROVIDER} → ${name}${tag ? ` (${tag})` : ""}`, "info");
+					ctx.ui.notify(`${prov} → ${name}${tag ? ` (${tag})` : ""}`, "info");
 					updateStatus(ctx);
 				} catch (e: any) {
 					ctx.ui.notify(e.message ?? String(e), "error");
@@ -323,35 +353,49 @@ export default function (pi: ExtensionAPI) {
 
 			switch (argv[0]) {
 				case undefined: {
-					const names = Object.keys(profiles);
-					if (names.length === 0) {
-						ctx.ui.notify("No profiles yet. Save the current login with /account save <name>.", "info");
+					const entries: Array<{ name: string; provider: string }> = [];
+					for (const [provider, ps] of Object.entries(store)) {
+						for (const name of Object.keys(ps.profiles)) entries.push({ name, provider });
+					}
+					if (entries.length === 0) {
+						ctx.ui.notify("No profiles yet. Save one with /account save <name> or /account add <name>.", "info");
 						return;
 					}
 					if (!ctx.hasUI) return;
-					const labels = names.map(describe);
-					const choice = await ctx.ui.select(`Switch ${PROVIDER} account:`, labels);
+					const labels = entries.map((e) => describe(e.name, e.provider));
+					const choice = await ctx.ui.select(`Switch account:`, labels);
 					if (choice === undefined) return;
-					await doSwitch(names[labels.indexOf(choice)]);
+					const picked = entries[labels.indexOf(choice)];
+					await doSwitch(picked.name, picked.provider);
 					return;
 				}
 				case "list": {
-					const names = Object.keys(profiles);
-					ctx.ui.notify(names.length ? names.map(describe).join("\n") : "No profiles saved.", "info");
+					const provider = argv[1];
+					const lines: string[] = [];
+					for (const [prov, ps] of Object.entries(store)) {
+						if (provider && prov !== provider) continue;
+						for (const name of Object.keys(ps.profiles)) lines.push(describe(name, prov));
+					}
+					ctx.ui.notify(lines.length ? lines.join("\n") : "No profiles saved.", "info");
 					return;
 				}
 				case "whoami": {
-					const current = (readJson(authPath()) ?? {})[PROVIDER] as Credential | undefined;
-					if (!current) return ctx.ui.notify(`No ${PROVIDER} credential in auth.json.`, "error");
-					if (current.type !== "oauth") return ctx.ui.notify(`Current ${PROVIDER} credential is an API key ${keyPrefix(current)}.`, "info");
+					const provider = argv[1] ?? PROVIDER;
+					const current = (readJson(authPath()) ?? {})[provider] as Credential | undefined;
+					if (!current) return ctx.ui.notify(`No ${provider} credential in auth.json.`, "error");
+					if (current.type !== "oauth")
+						return ctx.ui.notify(`Current ${provider} credential is an API key ${keyPrefix(current)}.`, "info");
+					if (provider !== PROVIDER)
+						return ctx.ui.notify(`whoami is implemented for the ${PROVIDER} provider only.`, "warning");
 					const id = await whois(String(current.access));
 					ctx.ui.notify(id?.email ? `${id.email}` : "Could not identify token (expired or offline).", "info");
 					return;
 				}
 				case "save": {
-					if (!argv[1]) return ctx.ui.notify("Usage: /account save <name>", "error");
+					if (!argv[1]) return ctx.ui.notify("Usage: /account save <name> [provider]", "error");
+					const provider = argv[2] ?? PROVIDER;
 					try {
-						const prof = await performSave(argv[1]);
+						const prof = await performSave(argv[1], provider);
 						ctx.ui.notify(`Saved "${argv[1]}"${prof.email ? ` (${prof.email})` : ""} and marked it active.`, "info");
 						updateStatus(ctx);
 					} catch (e: any) {
@@ -360,19 +404,20 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				case "add": {
-					if (!argv[1]) return ctx.ui.notify("Usage: /account add <name>", "error");
+					if (!argv[1]) return ctx.ui.notify("Usage: /account add <name> [provider]", "error");
+					const provider = argv[2] ?? PROVIDER;
 					if (!ctx.hasUI) return;
-					const key = (await ctx.ui.input(`Paste Anthropic API key for "${argv[1]}":`, "sk-ant-..."))?.trim();
+					const key = (await ctx.ui.input(`Paste API key for "${argv[1]}" (${provider}):`, "sk-..."))?.trim();
 					if (!key) return ctx.ui.notify("Cancelled.", "info");
 					try {
-						await performAddKey(argv[1], key);
+						await performAddKey(argv[1], key, provider);
 					} catch (e: any) {
 						return ctx.ui.notify(e.message ?? String(e), "error");
 					}
 					try {
-						const { profile } = await performSwitch(argv[1]);
+						const { profile } = await performSwitch(argv[1], provider);
 						const tag = profile.email ?? (profile.credential.type === "api_key" ? `API key ${keyPrefix(profile.credential)}` : "");
-						ctx.ui.notify(`${PROVIDER} → ${argv[1]}${tag ? ` (${tag})` : ""}`, "info");
+						ctx.ui.notify(`${provider} → ${argv[1]}${tag ? ` (${tag})` : ""}`, "info");
 						updateStatus(ctx);
 					} catch (e: any) {
 						ctx.ui.notify(
@@ -385,19 +430,29 @@ export default function (pi: ExtensionAPI) {
 				}
 				case "remove": {
 					const name = argv[1];
-					if (!name || !profiles[name]) return ctx.ui.notify(`No profile "${name ?? ""}".`, "error");
-					if (ctx.hasUI && !(await ctx.ui.confirm("Remove profile", `Delete stored credential "${name}"?`))) return;
+					const provider = argv[2];
+					if (!name) return ctx.ui.notify(`No profile "${name ?? ""}".`, "error");
+					const matches = provider ? (store[provider]?.profiles?.[name] ? [{ provider }] : []) : findProfiles(name);
+					if (matches.length === 0) return ctx.ui.notify(`No profile "${name}".`, "error");
+					if (matches.length > 1)
+						return ctx.ui.notify(
+							`Profile "${name}" exists for multiple providers: ${matches.map((m) => m.provider).join(", ")}. ` +
+								`Use /account remove ${name} <provider>.`,
+							"error",
+						);
+					const prov = matches[0].provider;
+					if (ctx.hasUI && !(await ctx.ui.confirm("Remove profile", `Delete stored credential "${name}" (${prov})?`))) return;
 					const full = readStore();
-					delete full[PROVIDER].profiles[name];
-					if (full[PROVIDER].active === name) full[PROVIDER].active = undefined;
+					delete full[prov].profiles[name];
+					if (full[prov].active === name) full[prov].active = undefined;
 					writeJson(storePath(), full);
-					ctx.ui.notify(`Removed "${name}".`, "info");
+					ctx.ui.notify(`Removed "${name}" from ${prov}.`, "info");
 					updateStatus(ctx);
 					return;
 				}
 				default: {
-					if (profiles[argv[0]]) return doSwitch(argv[0]);
-					ctx.ui.notify(`Unknown profile or subcommand "${argv[0]}". Try /account list.`, "error");
+					// /account <name> [provider]
+					return doSwitch(argv[0], argv[1]);
 				}
 			}
 		},

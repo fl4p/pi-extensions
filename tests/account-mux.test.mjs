@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, w
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { performAddKey, performSave, performSwitch } from "../extensions/account-mux.ts";
+import { findProfiles, performAddKey, performSave, performSwitch } from "../extensions/account-mux.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "account-mux-"));
 process.env.PI_CODING_AGENT_DIR = dir;
@@ -114,10 +114,36 @@ test("switching to an api_key profile swaps auth.json and preserves other provid
 	assert.ok(!existsSync(`${authPath}.lock`));
 });
 
-test("performAddKey rejects non-Anthropic keys and bad names", async () => {
+test("performAddKey rejects short keys and bad names", async () => {
 	seed();
-	await assert.rejects(() => performAddKey("bad", "not-an-anthropic-key"), /Anthropic API key/);
+	await assert.rejects(() => performAddKey("bad", "sk-short"), /too short/i);
 	await assert.rejects(() => performAddKey("bad name", "sk-ant-x"), /Invalid profile name/);
+});
+
+test("performAddKey and switch work for a non-anthropic provider", async () => {
+	seed();
+	const prof = await performAddKey("codex", "sk-proj-1234567890abcdef", "openai");
+	assert.equal(prof.credential.type, "api_key");
+	assert.equal(readStore().openai.profiles.codex.credential.key, "sk-proj-1234567890abcdef");
+	// anthropic active unchanged, auth.json anthropic untouched
+	assert.equal(readStore().anthropic.active, "alpha");
+	assert.deepEqual(readAuth().anthropic, credA);
+
+	await performSwitch("codex", "openai");
+	assert.equal(readAuth().openai.type, "api_key");
+	assert.equal(readAuth().openai.key, "sk-proj-1234567890abcdef");
+	assert.deepEqual(readAuth().anthropic, credA);
+	assert.equal(readStore().openai.active, "codex");
+});
+
+test("findProfiles locates a name across providers", async () => {
+	seed();
+	await performAddKey("shared", "sk-proj-1234567890abcdef", "openai");
+	await performAddKey("shared", "sk-ant-api03-XYZW1234");
+	const matches = findProfiles("shared");
+	assert.equal(matches.length, 2);
+	assert.ok(matches.some((m) => m.provider === "anthropic"));
+	assert.ok(matches.some((m) => m.provider === "openai"));
 });
 
 test("a foreign credential with a known owner is synced into that profile, not the active one", async () => {

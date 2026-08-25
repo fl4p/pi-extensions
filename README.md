@@ -6,19 +6,19 @@ Personal extensions for [pi](https://github.com/earendil-works/pi-coding-agent),
 
 ### account-mux
 
-Switch the `anthropic` provider between multiple accounts without re-running `/login`.
+Switch pi's `auth.json` between multiple accounts and API keys across providers (Anthropic by default; any provider works for API keys).
 
-Named credential profiles live in `~/.pi/agent/auth-profiles.json`; a switch swaps the `anthropic` entry of `~/.pi/agent/auth.json`. Pi re-reads `auth.json` when its file revision changes, so switches take effect immediately, even in running sessions. The active profile is shown in the status bar (`⇄ name`).
+Named credential profiles live in `~/.pi/agent/auth-profiles.json`, keyed by provider; a switch swaps that provider's entry of `~/.pi/agent/auth.json`. Pi re-reads `auth.json` when its file revision changes, so switches take effect immediately, even in running sessions. The active **anthropic** profile is shown in the status bar (`⇄ name`).
 
 | Command | What it does |
 |---------|--------------|
-| `/account` | Pick a profile to switch to. |
-| `/account <name>` | Switch directly (tab-completes). |
-| `/account save <name>` | Snapshot the current `auth.json` credential as a profile and mark it active. |
-| `/account add <name>` | Prompt for an Anthropic API key and store it as a profile (then switch to it). |
-| `/account remove <name>` | Delete a stored profile. |
-| `/account list` | List profiles with emails; marks the active one. |
-| `/account whoami` | Ask the Anthropic API which account the live token belongs to. |
+| `/account` | Pick a profile to switch to (all providers). |
+| `/account <name> [provider]` | Switch directly. Searches all providers if `provider` omitted; errors if the name exists under more than one. |
+| `/account add <name> [provider]` | Prompt for an API key, store it as a profile, and switch to it. `provider` defaults to `anthropic` — use e.g. `openai` for a Codex key. |
+| `/account save <name> [provider]` | Snapshot the current `auth.json` credential for `provider` as a profile and mark it active. |
+| `/account remove <name> [provider]` | Delete a stored profile. |
+| `/account list [provider]` | List profiles (all providers, or one) with emails / key prefixes; marks the active one. |
+| `/account whoami [provider]` | Ask the Anthropic API which account the live token belongs to (anthropic oauth only). |
 
 Safeguards, all of which exist because OAuth tokens rotate on refresh and several pi sessions share one `auth.json`:
 
@@ -32,7 +32,7 @@ Safeguards, all of which exist because OAuth tokens rotate on refresh and severa
 ln -s /path/to/pi-extensions/extensions/account-mux.ts ~/.pi/agent/extensions/account-mux.ts
 ```
 
-Then restart pi (or `/reload`). Bootstrap by logging into each account via `/login` and running `/account save <name>` after each, or `/account add <name>` to register an API key profile without `/login`.
+Then restart pi (or `/reload`). Bootstrap by logging into each account via `/login` and running `/account save <name>` after each, or `/account add <name> [provider]` to register an API key profile without `/login`.
 
 ### bash-background
 
