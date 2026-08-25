@@ -192,6 +192,8 @@ export default function (pi: ExtensionAPI) {
 	let ui: UiLike | undefined;
 	let debounce: ReturnType<typeof setTimeout> | undefined;
 	let lastWhois = 0;
+	const NOTIFY_COOLDOWN_MS = 10 * 60 * 1000;
+	const lastNotified = new Map<string, number>();
 
 	const onAuthChange = async () => {
 		if (Date.now() < selfWriteUntil) return;
@@ -199,7 +201,10 @@ export default function (pi: ExtensionAPI) {
 		const active = ps?.active ? ps.profiles[ps.active] : undefined;
 		if (!active) return;
 		const current = (readJson(authPath()) ?? {})[PROVIDER] as Credential | undefined;
-		if (!current || JSON.stringify(current) === JSON.stringify(active.credential)) return;
+		if (!current || JSON.stringify(current) === JSON.stringify(active.credential)) {
+			ui?.setStatus("account", `⇄ ${ps.active}`);
+			return;
+		}
 		if (!credentialLooksLive(current) || Date.now() - lastWhois < 15_000) return;
 		lastWhois = Date.now();
 		const id = await whois(String(current.access));
@@ -224,11 +229,16 @@ export default function (pi: ExtensionAPI) {
 				writeJson(storePath(), store);
 			}
 			ui?.setStatus("account", `⇄ ${ps.active} ⚠ ${id.email}`);
-			ui?.notify(
-				`Another process overwrote auth.json with ${id.email} (active profile: ${ps.active}). ` +
-					`Run /account ${ps.active} to re-assert, or restart old pi sessions.`,
-				"warning",
-			);
+			const last = lastNotified.get(id.email) ?? 0;
+			if (Date.now() - last >= NOTIFY_COOLDOWN_MS) {
+				lastNotified.set(id.email, Date.now());
+				ui?.notify(
+					`Another process overwrote auth.json with ${id.email} (active profile: ${ps.active}). ` +
+						`Run /account ${ps.active} to re-assert, or restart old pi sessions. ` +
+						`(Repeats suppressed for 10 min; footer shows live state.)`,
+					"warning",
+				);
+			}
 		}
 	};
 
