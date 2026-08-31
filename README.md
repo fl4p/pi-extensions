@@ -182,6 +182,24 @@ ln -s /path/to/pi-extensions/extensions/turn-timer.ts ~/.pi/agent/extensions/tur
 
 Then restart pi (or `/reload`).
 
+### skill-reread
+
+Re-anchors skill knowledge after compaction.
+
+Pi loads skill bodies (SKILL.md and reference files) as ordinary `read` tool results, so compaction summarizes them away. Long agentic sessions then operate on summarized memory of API names and CLI flags and regress into invented-interface guess-loops (observed: six consecutive invented pcbnew attributes in one PCB-design run, all post-compaction).
+
+The extension tracks every `read` of a file under a skills directory (live, plus harvesting session history on resume) and, after each compaction, injects a context-visible steer message listing exactly those files, instructing the agent to re-read them before relying on any interface they document.
+
+Note for benchmarking/eval work: this actively helps the model — record its presence as part of the harness condition.
+
+#### Install
+
+```bash
+ln -s /path/to/pi-extensions/extensions/skill-reread.ts ~/.pi/agent/extensions/skill-reread.ts
+```
+
+Then restart pi (or `/reload`).
+
 ## Development
 
 ```bash
