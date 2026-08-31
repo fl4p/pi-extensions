@@ -1,18 +1,15 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import test from "node:test";
 
-test("every packaged extension imports successfully", async () => {
+test("every extension file is packaged, and every packaged extension imports", async () => {
 	const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
-	assert.deepEqual(pkg.pi.extensions, [
-		"./extensions/account-mux.ts",
-		"./extensions/bash-background.ts",
-		"./extensions/bash-duration.ts",
-		"./extensions/google-search.ts",
-		"./extensions/block-web-search.ts",
-		"./extensions/persistent-history.ts",
-		"./extensions/turn-timer.ts",
-	]);
+	const onDisk = (await readdir(new URL("../extensions", import.meta.url)))
+		.filter((name) => name.endsWith(".ts"))
+		.map((name) => `./extensions/${name}`);
+	// Derive the expected set from the directory so a new extension cannot be
+	// silently omitted from the package listing (or vice versa).
+	assert.deepEqual([...pkg.pi.extensions].sort(), onDisk.sort());
 	for (const path of pkg.pi.extensions) {
 		const module = await import(new URL(`../${path.slice(2)}`, import.meta.url));
 		assert.equal(typeof module.default, "function", path);

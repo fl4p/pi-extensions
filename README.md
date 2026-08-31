@@ -188,7 +188,7 @@ Re-anchors skill knowledge after compaction.
 
 Pi loads skill bodies (SKILL.md and reference files) as ordinary `read` tool results, so compaction summarizes them away. Long agentic sessions then operate on summarized memory of API names and CLI flags and regress into invented-interface guess-loops (observed: six consecutive invented pcbnew attributes in one PCB-design run, all post-compaction).
 
-The extension tracks every `read` of a file under a skills directory (live, plus harvesting session history on resume) and, after each compaction, injects a context-visible steer message listing exactly those files, instructing the agent to re-read them before relying on any interface they document.
+On each compaction the extension scans the active session branch for skill files that entered context — successful `read` tool calls on paths under a skills directory, and `/skill:name` expansions (whose `<skill ... location>` header carries the exact path wherever the skill lives) — and injects a context-visible message listing them, instructing the agent to re-read before relying on any interface they document. For threshold/manual compactions the message is appended without continuing the agent run; overflow-retry compactions deliver it with the retried turn. Skill files read via bash (`cat`/`grep`) are not tracked.
 
 Note for benchmarking/eval work: this actively helps the model — record its presence as part of the harness condition.
 
