@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 import autoContinue, { findStall, isStalledAssistant } from "../extensions/auto-continue.ts";
 
 function createHarness(options) {
@@ -15,6 +16,14 @@ function createHarness(options) {
 	};
 	autoContinue(pi, options);
 	return { handlers, sent };
+}
+
+// An injected continue that pi accepted produces a run: agent_start .. agent_end.
+// Sequence tests must replay that cycle between settles, or the one-send-per-run
+// gate (sentSinceLastStart) correctly refuses the next injection.
+function runCycle(handlers) {
+	handlers.get("agent_start")({});
+	handlers.get("agent_end")({});
 }
 
 function ctxWithBranch(entries) {
@@ -92,30 +101,61 @@ test("a stalled settle triggers one continue with triggerTurn", () => {
 	assert.deepEqual(sent[0].options, { triggerTurn: true });
 });
 
+test("one send per started run: a duplicate settle over the same stall is ignored", () => {
+	const { handlers, sent } = createHarness();
+	const settle = handlers.get("agent_settled");
+	const stalled = ctxWithBranch([assistant("stop", [])]);
+	settle({}, stalled);
+	settle({}, stalled); // spurious settle in the agent_end -> agent_settled gap
+	assert.equal(sent.length, 1);
+	assert.match(sent[0].message.content, /\(1\/3\)/); // budget consumed once, not twice
+	runCycle(handlers); // the injected run happens and stalls again
+	settle({}, stalled);
+	assert.equal(sent.length, 2);
+	assert.match(sent[1].message.content, /\(2\/3\)/);
+});
+
 test("a healthy settle sends nothing and resets the cap", () => {
 	const { handlers, sent } = createHarness({ maxConsecutive: 2 });
 	const settle = handlers.get("agent_settled");
 	const stalled = ctxWithBranch([assistant("stop", [])]);
 	settle({}, stalled);
+	runCycle(handlers);
 	settle({}, stalled);
+	runCycle(handlers);
 	settle({}, stalled); // cap of 2 reached
 	assert.equal(sent.length, 2);
+	runCycle(handlers);
 	settle({}, ctxWithBranch([assistant("stop", HEALTHY)])); // healthy: reset
 	assert.equal(sent.length, 2);
+	runCycle(handlers);
 	settle({}, stalled); // budget is fresh again
 	assert.equal(sent.length, 3);
 });
 
-test("user input resets the cap", () => {
+test("interactive and rpc input reset the cap; extension input does not", () => {
 	const { handlers, sent } = createHarness({ maxConsecutive: 1 });
 	const settle = handlers.get("agent_settled");
 	const stalled = ctxWithBranch([assistant("length", THINKING_ONLY)]);
 	settle({}, stalled);
+	runCycle(handlers);
 	settle({}, stalled); // capped
 	assert.equal(sent.length, 1);
-	handlers.get("input")({});
+
+	handlers.get("input")({ source: "extension" }); // sendUserMessage from another extension
+	runCycle(handlers);
+	settle({}, stalled); // still capped: no human was here
+	assert.equal(sent.length, 1);
+
+	handlers.get("input")({ source: "interactive" });
+	runCycle(handlers);
 	settle({}, stalled);
 	assert.equal(sent.length, 2);
+
+	handlers.get("input")({ source: "rpc" });
+	runCycle(handlers);
+	settle({}, stalled);
+	assert.equal(sent.length, 3);
 });
 
 test("no action while a run is live or a compaction is in flight", () => {
@@ -136,13 +176,56 @@ test("no action while a run is live or a compaction is in flight", () => {
 	assert.equal(sent.length, 1);
 });
 
-test("agent_start clears a stranded compacting flag from a failed compaction", () => {
+test("the prompt gate suppresses settles between input and the run it starts", () => {
 	const { handlers, sent } = createHarness();
-	handlers.get("session_before_compact")({}); // compaction fails: no session_compact
+	const settle = handlers.get("agent_settled");
+	const stalled = ctxWithBranch([assistant("length", THINKING_ONLY)]);
+
+	// Human typed; prompt() is live. A pre-prompt compaction completes, then a
+	// spurious settle lands before agent_start: the previous stall is on the
+	// branch, the human's message is not yet — must NOT inject over the human.
+	handlers.get("input")({ source: "interactive" });
+	handlers.get("session_before_compact")({});
+	handlers.get("session_compact")({});
+	settle({}, stalled);
+	assert.equal(sent.length, 0);
+
+	// The human's run starts, runs, and stalls again: normal handling resumes.
+	runCycle(handlers);
+	settle({}, stalled);
+	assert.equal(sent.length, 1);
+});
+
+test("an orphaned prompt gate expires after its deadline", async () => {
+	const { handlers, sent } = createHarness({ promptGateMaxMs: 1 });
+	const settle = handlers.get("agent_settled");
+	const stalled = ctxWithBranch([assistant("stop", [])]);
+	// A "handled" input (e.g. a slash command) exits prompt() preflight and
+	// never reaches agent_start — the gate must not stay shut forever.
+	handlers.get("input")({ source: "interactive" });
+	settle({}, stalled);
+	assert.equal(sent.length, 0);
+	await sleep(10);
+	settle({}, stalled);
+	assert.equal(sent.length, 1);
+});
+
+test("compact-failed and agent_start both release a stranded compacting flag", () => {
+	const { handlers, sent } = createHarness();
+	const settle = handlers.get("agent_settled");
+	const stalled = ctxWithBranch([assistant("stop", [])]);
+
+	handlers.get("session_before_compact")({});
+	handlers.get("session_compact_failed")({}); // post-run auto-compaction failed
+	settle({}, stalled); // the legitimate final settle must still recover the stall
+	assert.equal(sent.length, 1);
+
+	runCycle(handlers);
+	handlers.get("session_before_compact")({}); // fails without even the failed event
 	handlers.get("agent_start")({});
 	handlers.get("agent_end")({});
-	handlers.get("agent_settled")({}, ctxWithBranch([assistant("stop", [])]));
-	assert.equal(sent.length, 1);
+	settle({}, stalled);
+	assert.equal(sent.length, 2);
 });
 
 test("counter message reflects the consecutive count", () => {
@@ -150,6 +233,7 @@ test("counter message reflects the consecutive count", () => {
 	const settle = handlers.get("agent_settled");
 	const stalled = ctxWithBranch([assistant("stop", [])]);
 	settle({}, stalled);
+	runCycle(handlers);
 	settle({}, stalled);
 	assert.match(sent[0].message.content, /\(1\/3\)/);
 	assert.match(sent[1].message.content, /\(2\/3\)/);

@@ -21,6 +21,9 @@
  * Deliberately NOT handled: stopReason "error" (pi's retry layer owns errors),
  * "aborted" (the user pressed ESC — never override a human), and length-stops
  * that did emit text (truncated but visible output; a human should judge it).
+ * Known trade-off: a task whose correct final answer is deliberately empty or
+ * thinking-only would receive up to maxConsecutive unwanted nudges; for
+ * agentic coding work such turns are stalls in practice.
  *
  * The handler runs synchronously — flag checks, branch scan, send — with no
  * awaits, so nothing can interleave between the decision and the send. If
@@ -38,6 +41,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 export interface AutoContinueOptions {
 	/** Max consecutive auto-continues before giving up (default 3). */
 	maxConsecutive?: number;
+	/** Lazy deadline releasing a prompt gate orphaned by a prompt() preflight exit (default 2 min). */
+	promptGateMaxMs?: number;
 }
 
 interface MessageEntry {
@@ -101,24 +106,63 @@ export function findStall(
 export default function autoContinue(pi: ExtensionAPI, options?: AutoContinueOptions) {
 	const maxConsecutive = options?.maxConsecutive ?? 3;
 
-	// Mirrors bash-background's gate, minimally: never act while a run is live
-	// (spurious agent_settled from rejected prompt wrappers) or a compaction is
-	// in flight (a manual /compact while idle, should a spurious settled land
-	// inside it). Registering session_before_compact is also what makes pi emit
-	// it. session_compact fires on success only, so a failed compaction strands
-	// the flag and disables auto-continue until the next agent_start clears it —
-	// skipping is the fail-safe direction, so that is accepted rather than
-	// cleared on a timer.
+	// Gate model, after bash-background's documented races (its lines 150-230
+	// are the authority on pi's agent_settled/compaction interleavings):
+	//
+	// - agentBusy: never act while a run is live — pi emits spurious
+	//   agent_settled from rejected prompt wrappers while the owning run holds
+	//   the loop.
+	// - compacting: never act while a compaction is in flight. Registering
+	//   session_before_compact is also what makes pi emit it; session_compact
+	//   fires on success only, so session_compact_failed (pi >= 0.84.3) and
+	//   agent_start also clear the flag to avoid stranding.
+	// - promptPending: `input` is the earliest extension-visible point in
+	//   prompt(), and prompt() runs pre-prompt compaction BEFORE agent_start —
+	//   a spurious settled in that window would see the previous run's stalled
+	//   assistant (the new user message is not on the branch yet) and inject a
+	//   run that collides with the human's prompt. Suppress from input until
+	//   agent_start/agent_end, with a lazy deadline for prompt() preflight
+	//   exits that never reach a run (handled input, missing model) — the
+	//   deadline is suspended while a compaction is actually running.
+	// - sentSinceLastStart: at most one injection per started run. Back-to-back
+	//   settles over the same stall (spurious settle in the agent_end →
+	//   agent_settled gap) must not double-send or double-count the budget.
+	//
+	// In every ambiguous state the extension skips without queuing or retrying;
+	// the next agent_settled reconsiders. Skipping is the fail-safe direction.
+	const promptGateMaxMs = options?.promptGateMaxMs ?? 2 * 60 * 1000;
+
 	let agentBusy = false;
 	let compacting = false;
+	let promptPending = false;
+	let promptPendingSince = 0;
+	let sentSinceLastStart = false;
 	let consecutive = 0;
+
+	function promptGateShut(): boolean {
+		if (!promptPending) return false;
+		// No deadline while compacting: releasing into a live compaction is the
+		// failure this gate exists to prevent.
+		if (compacting) return true;
+		if (Date.now() - promptPendingSince > promptGateMaxMs) {
+			promptPending = false;
+			return false;
+		}
+		return true;
+	}
 
 	pi.on("agent_start", () => {
 		agentBusy = true;
 		compacting = false;
+		promptPending = false;
+		sentSinceLastStart = false;
 	});
 	pi.on("agent_end", () => {
 		agentBusy = false;
+		// A steer delivered into a live run never gets its own agent_start; the
+		// run ending releases its prompt gate. The pre-prompt window is not
+		// weakened: there, input precedes any run, so no agent_end intervenes.
+		promptPending = false;
 	});
 	pi.on("session_before_compact", () => {
 		compacting = true;
@@ -126,13 +170,21 @@ export default function autoContinue(pi: ExtensionAPI, options?: AutoContinueOpt
 	pi.on("session_compact", () => {
 		compacting = false;
 	});
-	// A human is here; give a fresh stall budget.
-	pi.on("input", () => {
-		consecutive = 0;
+	pi.on("session_compact_failed", () => {
+		compacting = false;
+	});
+	pi.on("input", (event) => {
+		promptPending = true;
+		promptPendingSince = Date.now();
+		// Only a human replenishes the stall budget. Extension-sourced input
+		// (sendUserMessage from another extension) must not rearm the cap.
+		if (event.source === "interactive" || event.source === "rpc") {
+			consecutive = 0;
+		}
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
-		if (agentBusy || compacting) return;
+		if (agentBusy || compacting || sentSinceLastStart || promptGateShut()) return;
 		const stall = findStall(ctx);
 		if (stall === undefined) {
 			consecutive = 0;
@@ -140,6 +192,7 @@ export default function autoContinue(pi: ExtensionAPI, options?: AutoContinueOpt
 		}
 		if (consecutive >= maxConsecutive) return;
 		consecutive++;
+		sentSinceLastStart = true;
 		const shape =
 			stall.stopReason === "length"
 				? stall.thinkingOnly
