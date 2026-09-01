@@ -200,6 +200,26 @@ ln -s /path/to/pi-extensions/extensions/skill-reread.ts ~/.pi/agent/extensions/s
 
 Then restart pi (or `/reload`).
 
+### auto-continue
+
+Nudges the agent when a run ends with a contentless turn.
+
+Pi treats any assistant turn without a tool call as the end of the run and goes idle without warning. Providers produce such turns mid-task: `stopReason: "length"` with the whole token budget spent inside thinking (observed twice from GLM-5.3-Flash, at both 16k and 32k caps), and `stopReason: "stop"` with an entirely empty content array (observed once from the same serving at the context-window edge). Each one silently strands an unattended session until a human types "continue".
+
+On `agent_settled` (fired only after the run, automatic retries, and post-run compaction have all finished) the extension inspects the final assistant message on the active branch. If it stalled — `length` or `stop` with no tool call and no non-whitespace text — it sends a neutral continue message (`customType: "auto-continue"`, visible in the session file) that triggers a fresh run.
+
+Deliberately out of scope: `error` (pi's retry layer owns errors), `aborted` (the user pressed ESC), length-stops that did emit text (truncated but visible output — a human should judge it), and any stall a user message has already answered. Consecutive auto-continues are capped at 3; the cap resets on a productive turn end or real user input. While another run is live or a compaction is in flight it skips without queuing — skipping is the fail-safe direction.
+
+Note for benchmarking/eval work: this actively helps the model — an unattended session survives stalls a bare harness would not. Record its presence as part of the harness condition and count its injections as run events.
+
+#### Install
+
+```bash
+ln -s /path/to/pi-extensions/extensions/auto-continue.ts ~/.pi/agent/extensions/auto-continue.ts
+```
+
+Then restart pi (or `/reload`).
+
 ## Development
 
 ```bash

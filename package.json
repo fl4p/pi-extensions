@@ -17,7 +17,8 @@
       "./extensions/block-web-search.ts",
       "./extensions/persistent-history.ts",
       "./extensions/turn-timer.ts",
-      "./extensions/skill-reread.ts"
+      "./extensions/skill-reread.ts",
+      "./extensions/auto-continue.ts"
     ]
   },
   "keywords": ["pi", "pi-coding-agent", "extensions"],
