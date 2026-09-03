@@ -13,10 +13,31 @@
  * Fix: on `agent_settled` — which pi fires only after the run, its automatic
  * retries, and post-run compaction have all finished — inspect the final
  * assistant message on the active branch. If it stalled (stopReason "length"
- * or "stop" with no tool call and no non-whitespace text) send a neutral
- * continue message that triggers a fresh run. Consecutive auto-continues are
- * capped (default 3) so a model that stalls forever cannot loop-bill; the cap
- * resets on any productive turn end or real user input.
+ * or "stop" with no tool call and no non-whitespace text) send a continue
+ * message that triggers a fresh run. Consecutive auto-continues are capped
+ * (default 3) so a model that stalls forever cannot loop-bill; the cap resets
+ * on any productive turn end or real user input.
+ *
+ * The thinking-overflow nudge is action-forcing, not neutral. Measured
+ * (glm5p3-flash, Fireworks, 2026-09-03, exact captured payload replays): pi
+ * drops thinking-only stalled turns from history (no content, no tool_calls),
+ * so the model never sees its own overflowed reasoning and restarts the full
+ * plan from scratch every turn — a Sisyphus loop no budget fixes (131,072
+ * tokens: still 100% reasoning, finish=length; the model was hand-computing
+ * an entire PCB routing solution in-head). Two interventions each broke the
+ * loop on the identical payload:
+ *   - a nudge saying the reasoning was discarded + act in small tool-call
+ *     steps + persist plans to files → 896 thinking chars, then a large
+ *     productive tool call;
+ *   - `tool_choice: "required"` → 1,393 completion tokens, clean tool call.
+ * Both are used here: the tested nudge text on every thinking-overflow stall,
+ * and from the second consecutive stall on (configurable) a one-shot
+ * `tool_choice: "required"` injected into the recovery run's first provider
+ * request via `before_provider_request`. The injection only touches
+ * OpenAI-completions-style payloads that carry function tools and no explicit
+ * tool_choice (Anthropic-style payloads are skipped: `{type:"any"}` conflicts
+ * with extended thinking), and is consumed only when actually applied, so a
+ * tool-less compaction/summarization request passes through unchanged.
  *
  * Deliberately NOT handled: stopReason "error" (pi's retry layer owns errors),
  * "aborted" (the user pressed ESC — never override a human), and length-stops
@@ -43,6 +64,12 @@ export interface AutoContinueOptions {
 	maxConsecutive?: number;
 	/** Lazy deadline releasing a prompt gate orphaned by a prompt() preflight exit (default 2 min). */
 	promptGateMaxMs?: number;
+	/**
+	 * From this consecutive-stall count on, the recovery run's first provider
+	 * request gets `tool_choice: "required"` (default 2; 1 = every recovery,
+	 * Infinity = never force).
+	 */
+	forceToolCallFrom?: number;
 }
 
 interface MessageEntry {
@@ -103,8 +130,29 @@ export function findStall(
 	return undefined;
 }
 
+/**
+ * Return a copy of an OpenAI-completions-style payload with
+ * `tool_choice: "required"`, or undefined when the payload must not be touched:
+ * not an object, already has an explicit tool_choice, carries no function
+ * tools (e.g. a compaction/summarization request), or is Anthropic-style
+ * (where `tool_choice: {type:"any"}` conflicts with extended thinking).
+ */
+export function applyToolChoiceRequired(payload: unknown): Record<string, unknown> | undefined {
+	if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return undefined;
+	const p = payload as Record<string, unknown>;
+	if (p.tool_choice !== undefined) return undefined;
+	const tools = p.tools;
+	if (!Array.isArray(tools) || tools.length === 0) return undefined;
+	const openaiStyle = tools.every(
+		(t: unknown) => typeof t === "object" && t !== null && (t as { type?: unknown }).type === "function",
+	);
+	if (!openaiStyle) return undefined;
+	return { ...p, tool_choice: "required" };
+}
+
 export default function autoContinue(pi: ExtensionAPI, options?: AutoContinueOptions) {
 	const maxConsecutive = options?.maxConsecutive ?? 3;
+	const forceToolCallFrom = options?.forceToolCallFrom ?? 2;
 
 	// Gate model, after bash-background's documented races (its lines 150-230
 	// are the authority on pi's agent_settled/compaction interleavings):
@@ -138,6 +186,10 @@ export default function autoContinue(pi: ExtensionAPI, options?: AutoContinueOpt
 	let promptPendingSince = 0;
 	let sentSinceLastStart = false;
 	let consecutive = 0;
+	// One-shot: the next provider request that can carry tool_choice gets
+	// "required". Consumed only when actually applied, so tool-less requests
+	// (compaction) pass through without spending it.
+	let forceToolCallPending = false;
 
 	function promptGateShut(): boolean {
 		if (!promptPending) return false;
@@ -176,6 +228,8 @@ export default function autoContinue(pi: ExtensionAPI, options?: AutoContinueOpt
 	pi.on("input", (event) => {
 		promptPending = true;
 		promptPendingSince = Date.now();
+		// A new prompt owns the next run — never force a tool call on it.
+		forceToolCallPending = false;
 		// Only a human replenishes the stall budget. Extension-sourced input
 		// (sendUserMessage from another extension) must not rearm the cap.
 		if (event.source === "interactive" || event.source === "rpc") {
@@ -183,11 +237,22 @@ export default function autoContinue(pi: ExtensionAPI, options?: AutoContinueOpt
 		}
 	});
 
+	pi.on("before_provider_request", (event) => {
+		if (!forceToolCallPending) return undefined;
+		const next = applyToolChoiceRequired(event.payload);
+		if (next !== undefined) {
+			forceToolCallPending = false;
+		}
+		return next;
+	});
+
 	pi.on("agent_settled", (_event, ctx) => {
 		if (agentBusy || compacting || sentSinceLastStart || promptGateShut()) return;
 		const stall = findStall(ctx);
 		if (stall === undefined) {
 			consecutive = 0;
+			// A healthy settle means any armed one-shot was never needed.
+			forceToolCallPending = false;
 			return;
 		}
 		if (consecutive >= maxConsecutive) return;
@@ -199,13 +264,30 @@ export default function autoContinue(pi: ExtensionAPI, options?: AutoContinueOpt
 					? "the entire token budget was spent inside thinking"
 					: "the output hit the token limit with no text or tool call"
 				: "the model returned an empty message";
+		// Length stalls get the action-forcing recovery text (validated against a
+		// captured stall payload: it collapsed a non-terminating 131k-token
+		// reasoning loop into a small think plus a productive tool call). Empty
+		// messages keep the neutral nudge.
+		const instruction =
+			stall.stopReason === "length"
+				? "That output was discarded — none of it was saved, and re-deriving a full plan " +
+					"in your head will overflow and be lost again. Act now: emit a tool call " +
+					"implementing only the next single small step, and persist any plan you need " +
+					"by writing it to a file first. Keep each turn small, and split long file " +
+					"writes into several smaller steps."
+				: "Continue the task from where you left off.";
+		const forceToolCall = consecutive >= forceToolCallFrom;
+		if (forceToolCall) {
+			forceToolCallPending = true;
+		}
 		pi.sendMessage(
 			{
 				customType: "auto-continue",
 				content:
 					`Automatic continue (${consecutive}/${maxConsecutive}): the previous turn ` +
 					`ended with no usable output — stopReason=${stall.stopReason}, ${shape}. ` +
-					"Continue the task from where you left off.",
+					instruction +
+					(forceToolCall ? " (This turn is constrained to produce a tool call.)" : ""),
 				display: true,
 			},
 			{ triggerTurn: true },

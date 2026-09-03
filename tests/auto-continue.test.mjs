@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
-import autoContinue, { findStall, isStalledAssistant } from "../extensions/auto-continue.ts";
+import autoContinue, {
+	applyToolChoiceRequired,
+	findStall,
+	isStalledAssistant,
+} from "../extensions/auto-continue.ts";
 
 function createHarness(options) {
 	const handlers = new Map();
@@ -238,4 +242,85 @@ test("counter message reflects the consecutive count", () => {
 	assert.match(sent[0].message.content, /\(1\/3\)/);
 	assert.match(sent[1].message.content, /\(2\/3\)/);
 	assert.match(sent[1].message.content, /empty message/);
+});
+
+test("length stalls carry the action-forcing recovery text; empty stalls stay neutral", () => {
+	const { handlers, sent } = createHarness();
+	const settle = handlers.get("agent_settled");
+	settle({}, ctxWithBranch([assistant("length", THINKING_ONLY)]));
+	assert.match(sent[0].message.content, /discarded/);
+	assert.match(sent[0].message.content, /next single small step/);
+	runCycle(handlers);
+	handlers.get("input")({ source: "interactive" });
+	runCycle(handlers);
+	settle({}, ctxWithBranch([assistant("stop", [])]));
+	assert.match(sent[1].message.content, /Continue the task from where you left off/);
+	assert.doesNotMatch(sent[1].message.content, /discarded/);
+});
+
+const OPENAI_PAYLOAD = {
+	model: "m",
+	messages: [],
+	tools: [{ type: "function", function: { name: "bash" } }],
+};
+
+test("applyToolChoiceRequired: shapes it must and must not touch", () => {
+	assert.deepEqual(applyToolChoiceRequired(OPENAI_PAYLOAD), {
+		...OPENAI_PAYLOAD,
+		tool_choice: "required",
+	});
+	// Anthropic-style tools ({type:"any"} conflicts with extended thinking).
+	assert.equal(
+		applyToolChoiceRequired({ tools: [{ name: "bash", input_schema: {} }] }),
+		undefined,
+	);
+	// No tools (e.g. a compaction/summarization request).
+	assert.equal(applyToolChoiceRequired({ model: "m", messages: [] }), undefined);
+	assert.equal(applyToolChoiceRequired({ tools: [] }), undefined);
+	// An explicit tool_choice is never overridden.
+	assert.equal(
+		applyToolChoiceRequired({ ...OPENAI_PAYLOAD, tool_choice: "auto" }),
+		undefined,
+	);
+	assert.equal(applyToolChoiceRequired("nope"), undefined);
+	assert.equal(applyToolChoiceRequired(null), undefined);
+});
+
+test("tool_choice escalation arms on the second consecutive stall and is one-shot", () => {
+	const { handlers, sent } = createHarness();
+	const settle = handlers.get("agent_settled");
+	const request = handlers.get("before_provider_request");
+	const stalled = ctxWithBranch([assistant("length", THINKING_ONLY)]);
+
+	settle({}, stalled); // stall 1: nudge only
+	assert.doesNotMatch(sent[0].message.content, /constrained/);
+	assert.equal(request({ payload: OPENAI_PAYLOAD }), undefined);
+
+	runCycle(handlers);
+	settle({}, stalled); // stall 2: nudge + one-shot force
+	assert.match(sent[1].message.content, /constrained to produce a tool call/);
+	// A tool-less request (compaction) passes through without consuming the shot.
+	assert.equal(request({ payload: { model: "m", messages: [] } }), undefined);
+	const forced = request({ payload: OPENAI_PAYLOAD });
+	assert.equal(forced.tool_choice, "required");
+	// Consumed: the run's later turns are unconstrained.
+	assert.equal(request({ payload: OPENAI_PAYLOAD }), undefined);
+});
+
+test("human input and a healthy settle disarm a pending tool_choice shot", () => {
+	const { handlers, sent } = createHarness({ forceToolCallFrom: 1 });
+	const settle = handlers.get("agent_settled");
+	const request = handlers.get("before_provider_request");
+	const stalled = ctxWithBranch([assistant("length", THINKING_ONLY)]);
+
+	settle({}, stalled); // forceToolCallFrom=1: armed immediately
+	assert.match(sent[0].message.content, /constrained/);
+	handlers.get("input")({ source: "interactive" }); // human takes over
+	assert.equal(request({ payload: OPENAI_PAYLOAD }), undefined);
+
+	runCycle(handlers);
+	settle({}, stalled); // re-armed
+	runCycle(handlers);
+	settle({}, ctxWithBranch([assistant("stop", HEALTHY)])); // healthy: disarmed
+	assert.equal(request({ payload: OPENAI_PAYLOAD }), undefined);
 });
