@@ -113,6 +113,71 @@ Or store it in `~/.pi/web-search.json` and restrict the file permissions:
 chmod 600 ~/.pi/web-search.json
 ```
 
+### claude-code
+
+Registers the official, unmodified Claude Code CLI as a Pi model provider.
+After reloading, open `/model`, choose provider `claude-code`, and select one of:
+
+- `default` — use Claude Code's configured default model (no `--model` flag)
+- `fable` — invoke Claude Code with `--model fable`
+- `sonnet` — invoke Claude Code with `--model sonnet`
+- `opus` — invoke Claude Code with `--model opus`
+
+Pi's conversation, system prompt, tool definitions, and tool results are sent
+to `claude -p` on stdin for every provider request. Each semantic Pi message is
+a separate stream-JSON text block, preserving an exact unchanged prefix as the
+history grows so Anthropic's automatic prompt cache can reuse it across fresh
+CLI processes. Changing models or rewriting/compacting earlier history starts a
+new cache prefix. Provider accounting metadata and opaque reasoning signatures
+are not forwarded.
+
+Claude returns structured text and Pi tool calls; Pi executes those calls in
+its normal agent loop. Claude Code's normal coding tools (`Read`, `Bash`, `Edit`,
+etc.) are disabled. The JSON-schema interface still uses Claude Code's internal
+`StructuredOutput` mechanism; Pi alone executes the advertised coding tools.
+The CLI also runs with `--safe-mode`, which preserves auth and model selection
+while disabling user/project hooks, plugins, MCP servers, skills, and CLAUDE.md
+loading. The subprocess therefore cannot perform hidden customization-driven
+edits or commands outside Pi's visible tool loop.
+
+Every request starts a new, non-persisted CLI process. It is spawned directly
+with `shell: false` and never with `--bare`, so it uses its normal local Claude
+Code authentication, including a logged-in Anthropic subscription. The
+extension never reads or copies Claude credentials.
+The child environment disables Claude Code's background session-title request
+and other nonessential network traffic, so the full Pi prompt is sent only for
+the actual provider request. It also requests Claude Code's minimal system
+prompt, suppressing the normal coding-agent instruction bundle; Claude Code's
+small SDK identity and subscription-billing markers remain on the wire. Fable
+also adds a short reporting-accuracy rule that Claude Code 2.1.260 provides no
+supported switch to remove. This integration requires a Claude Code release
+with `--safe-mode` and `--permission-prompts`; it is tested with 2.1.260.
+The executable defaults to `claude`; set `CLAUDE_CODE_EXECUTABLE` when it is
+installed elsewhere. Requests default to five minutes and are capped at 30
+minutes, 4 MiB of serialized input, and 1 MiB each of stdout/stderr. Abort,
+timeout, or excessive output terminates the complete subprocess group.
+
+The provider is text-only because the Claude Code print interface does not
+accept Pi's in-memory image blocks. Binary image data is omitted from cross-
+provider history with an explicit placeholder.
+
+Install this extension alone:
+
+```bash
+ln -s /path/to/pi-extensions/extensions/claude-code.ts ~/.pi/agent/extensions/claude-code.ts
+```
+
+Or install this repository as a Pi package; `package.json` loads the extension
+automatically:
+
+```bash
+pi install git:github.com/fl4p/pi-extensions
+```
+
+Authenticate the official CLI first (`claude`), then restart Pi or run
+`/reload`. Select the provider through `/model`; no `claude_code` tool is
+registered.
+
 ### block-web-search
 
 Removes `web_search` (the Gemini-synthesis provider) from the active tool set at `session_start`, forcing the agent to use `google_search` (raw Google blue links via Serper) + `ctx_fetch_and_index` / `fetch_content` for primary sources instead.

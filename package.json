@@ -13,6 +13,7 @@
       "./extensions/account-mux.ts",
       "./extensions/bash-background.ts",
       "./extensions/bash-duration.ts",
+      "./extensions/claude-code.ts",
       "./extensions/google-search.ts",
       "./extensions/block-web-search.ts",
       "./extensions/persistent-history.ts",
