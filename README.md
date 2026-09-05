@@ -43,11 +43,20 @@ Tools:
 | Tool | What it does |
 |------|--------------|
 | `bash_background({ command, timeout, description? })` | Spawn detached, capture combined stdout+stderr to a logfile, return immediately. Wake once on exit or timeout. |
-| `monitor({ command, description? })` | Spawn detached and wake on new output in coalesced batches, plus once on exit. |
+| `monitor({ command, description?, silenceWarning? })` | Spawn detached and wake on new output in coalesced batches, plus once on exit. Warns once if it stays silent. |
 | `background_stop({ id })` | Tree-kill a running job by id. |
 | `background_list()` | List live jobs. |
 
 Use `bash_background` for finite long jobs like builds/tests, and `monitor` for streaming commands like dev servers or `tail -F`. `bash_background` requires a unit-bearing timeout such as `"30m"` or `"2h"` (maximum `24h`); bare numbers are rejected. `monitor` remains unbounded until stopped or the session shuts down. While the agent is busy, monitor output stays in one bounded extension-local batch; it is delivered after the agent settles, or discarded if the monitor is stopped first. This prevents uncancellable follow-up messages from accumulating in Pi's input queue.
+
+A `monitor` wakes only on **new output**, so one whose filter never matches is silent forever and
+reads exactly like a healthy quiet run — the agent waits on a notification that cannot arrive. After
+10 minutes with no output at all, a live monitor therefore wakes **once** to say so and to suggest
+checking the pattern against what the source actually emits. It is advisory: the job is not stopped
+or altered, since a genuinely idle source is legitimate. Tune with `silenceWarning` (`"5m"`, or
+`"off"` for a source that is meant to be quiet for long stretches); bare numbers are rejected, as
+with `bash_background`'s timeout. The timer starts at spawn, so a very short window can fire while
+a slow process is still booting.
 
 Logs use random exclusive files with mode `0600`. They remain readable for 24 hours after completion and are then removed; stale logs are also cleaned on extension startup.
 

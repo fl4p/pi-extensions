@@ -51,6 +51,8 @@ interface Job {
 	droppingLine?: boolean;
 	truncated?: boolean; // pending was capped since last flush
 	flushTimer?: ReturnType<typeof setInterval>;
+	everProduced?: boolean; // the pipeline has emitted at least one byte
+	silenceHandle?: ReturnType<typeof setTimeout>; // one-shot "filter matched nothing" warning
 }
 
 // monitor: how often to deliver accumulated new output, and how much to keep
@@ -58,7 +60,22 @@ interface Job {
 // burst into one wake while still feeling near-real-time.
 const MONITOR_FLUSH_MS = 200;
 const MONITOR_MAX_PENDING_BYTES = 8_000;
+// monitor: a monitor only ever wakes on NEW OUTPUT, so one whose filter matches nothing is
+// silent forever and looks exactly like a healthy quiet run. That is the worst failure mode
+// this tool has: the agent waits on a notification that can never arrive. Measured 2026-09-05
+// on a 72-minute bench sweep -- a monitor armed on `pwm_freq ->` matched 0 of ~800 log lines
+// because that string came from a different launcher, and the mistake surfaced only when the
+// pattern was grepped by hand. So warn ONCE if a live monitor has produced nothing for this
+// long. One-shot, never repeating: the point is to question the filter, not to nag.
+const MONITOR_SILENCE_WARN_MS = 10 * 60 * 1000;
 const MAX_BACKGROUND_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+
+function formatDurationMs(ms: number) {
+	if (ms % 3_600_000 === 0) return `${ms / 3_600_000}h`;
+	if (ms % 60_000 === 0) return `${ms / 60_000}m`;
+	if (ms % 1_000 === 0) return `${ms / 1_000}s`;
+	return `${ms}ms`;
+}
 const LOG_RETENTION_MS = 24 * 60 * 60 * 1000;
 const LOG_PREFIX = "pi-bg-";
 const DURATION_PATTERN = "^[0-9]+(?:\\.[0-9]+)?(?:ms|s|m|h)$";
@@ -329,6 +346,26 @@ export default function (pi: ExtensionAPI, options?: { promptGateMaxMs?: number 
 		return `[monitor:${job.description}] (${job.id}) new output:\n${body}${note}`;
 	}
 
+	// One-shot. Fires only while the job is alive and has produced NOTHING; any byte on either
+	// stream disarms it in ingest(). Deliberately does not stop or touch the job -- a genuinely
+	// quiet source (an idle dev server) is legitimate, so this reports a suspicion, not a fault.
+	function armSilenceWarning(job: Job, ms: number) {
+		if (ms <= 0) return;
+		job.silenceHandle = setTimeout(() => {
+			job.silenceHandle = undefined;
+			if (job.stopped || job.done || job.everProduced) return;
+			enqueueWake(
+				job.id,
+				`[monitor:${job.description}] (${job.id}) has produced NO output in ${formatDurationMs(ms)} ` +
+					`and is still running. If it was expected to be quiet, ignore this. Otherwise the filter is ` +
+					`probably wrong -- a grep pattern that never matches is indistinguishable from a quiet run. ` +
+					`Check it against what the source actually emits (e.g. \`grep -c <pattern> <file>\`) rather ` +
+					`than waiting longer. Command: ${job.command}`,
+			);
+		}, ms);
+		job.silenceHandle.unref?.();
+	}
+
 	function hasPendingWork() {
 		if (deferredWakes.length > 0) return true;
 		for (const job of jobs.values()) {
@@ -434,6 +471,13 @@ export default function (pi: ExtensionAPI, options?: { promptGateMaxMs?: number 
 
 	function ingest(job: Job, chunk: Buffer) {
 		if (job.stopped || job.done) return;
+		if (!job.everProduced) {
+			job.everProduced = true;
+			if (job.silenceHandle) {
+				clearTimeout(job.silenceHandle);
+				job.silenceHandle = undefined;
+			}
+		}
 		if (job.logfd !== undefined) {
 			try {
 				writeSync(job.logfd, chunk);
@@ -473,6 +517,7 @@ export default function (pi: ExtensionAPI, options?: { promptGateMaxMs?: number 
 		if (job.timeoutHandle) clearTimeout(job.timeoutHandle);
 		if (job.killHandle) clearTimeout(job.killHandle);
 		if (job.flushTimer) clearInterval(job.flushTimer);
+		if (job.silenceHandle) clearTimeout(job.silenceHandle);
 		if (job.logfd !== undefined) {
 			try {
 				closeSync(job.logfd);
@@ -506,6 +551,8 @@ export default function (pi: ExtensionAPI, options?: { promptGateMaxMs?: number 
 			'Always give bash_background a unit-bearing timeout such as "30m" or "2h"; bare numbers are invalid.',
 			"Don't sleep-and-poll the logfile to await completion — the exit wake is automatic; Read it anytime for progress.",
 			"Stop with background_stop({id}); list with background_list().",
+			"A monitor only wakes on output, so a filter that never matches looks exactly like a quiet run. " +
+				'You get one warning after 10m of silence; tune with silenceWarning ("5m", or "off").',
 		],
 		parameters: Type.Object({
 			command: Type.String({ description: "The shell command to run in the background." }),
@@ -608,11 +655,32 @@ export default function (pi: ExtensionAPI, options?: { promptGateMaxMs?: number 
 		parameters: Type.Object({
 			command: Type.String({ description: "The shell command to run and monitor." }),
 			description: Type.Optional(Type.String({ description: "Short human-readable label (shown in notifications)." })),
+			silenceWarning: Type.Optional(
+				Type.String({
+					description:
+						'How long of NO output should trigger a one-shot "is your filter wrong?" warning. ' +
+						'Unit-bearing, e.g. "5m"; "off" disables it. Default 10m. Set "off" only for a source ' +
+						"that is legitimately silent for long stretches.",
+				}),
+			),
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx: ExtensionContext) {
 			const id = newId();
 			const description = params.description?.trim() || params.command.slice(0, 60);
+			let silenceMs = MONITOR_SILENCE_WARN_MS;
+			const rawSilence = params.silenceWarning?.trim();
+			if (rawSilence) {
+				if (rawSilence.toLowerCase() === "off") {
+					silenceMs = 0;
+				} else {
+					try {
+						silenceMs = parseDurationMs(rawSilence);
+					} catch (err) {
+						return errorResult(id, `Invalid silenceWarning: ${String(err instanceof Error ? err.message : err)}`);
+					}
+				}
+			}
 			let log: ReturnType<typeof createLogFile>;
 			try {
 				log = createLogFile(id);
@@ -655,6 +723,7 @@ export default function (pi: ExtensionAPI, options?: { promptGateMaxMs?: number 
 			child.stdout?.on("data", (c: Buffer) => ingest(job, c));
 			child.stderr?.on("data", (c: Buffer) => ingest(job, c));
 			job.flushTimer = setInterval(() => flush(job), MONITOR_FLUSH_MS);
+			armSilenceWarning(job, silenceMs);
 
 			child.on("error", (err) => finish(job, `[monitor:${description}] (${id}) failed to run: ${String(err)}.`));
 			// `close` (not `exit`) fires after stdout/stderr are fully drained, so the
@@ -674,7 +743,15 @@ export default function (pi: ExtensionAPI, options?: { promptGateMaxMs?: number 
 				);
 			});
 
-			return armedResult(id, child.pid, logpath, description, "produces output or exits");
+			return armedResult(
+				id,
+				child.pid,
+				logpath,
+				description,
+				silenceMs > 0
+					? `produces output or exits (and once if it is still silent after ${formatDurationMs(silenceMs)})`
+					: "produces output or exits",
+			);
 		},
 	});
 
