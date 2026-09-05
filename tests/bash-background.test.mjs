@@ -525,26 +525,30 @@ test("startup cleanup removes expired extension logs", () => {
 
 // ---- monitor silence warning -----------------------------------------------
 // A monitor wakes only on NEW OUTPUT, so one whose filter never matches is silent
-// forever and reads exactly like a healthy quiet run. These cover the three cases
-// that matter: it fires when nothing is produced, it does NOT fire when something
-// is, and "off" opts out. `silenceWarning` is given in ms here so the tests do not
-// have to wait minutes for the real 10m default.
+// forever and reads exactly like a healthy quiet run.
+//
+// These tests must PUMP the harness (emit agent_settled after each delivery). Without
+// that, agentBusy stays true after the first wake and every later wake sits in the
+// deferred queue, so `messages.length === 1` holds even if the code warns repeatedly --
+// the assertion passes for the wrong reason. Adversarial review of ee3888c caught
+// exactly that in the first version of these tests.
+// `silenceWarning` is given in ms so the tests need not wait out the real 10m default.
+
+async function pump(handlers) {
+	for (const handler of handlers.get("agent_settled") ?? []) await handler();
+	await new Promise((resolve) => setTimeout(resolve, 150));
+}
 
 test("a monitor that produces nothing warns once that its filter may be wrong", async () => {
 	const { tools, handlers, messages } = createHarness();
 	const monitor = tools.get("monitor");
 	const stop = tools.get("background_stop");
 	for (const handler of handlers.get("agent_start") ?? []) await handler();
-	for (const handler of handlers.get("agent_settled") ?? []) await handler();
+	await pump(handlers);
 
-	// Matches nothing, ever -- the shape of a wrong grep against a live source.
 	const result = await monitor.execute(
 		"monitor",
-		{
-			command: `node -e "setInterval(() => {}, 1000)"`,
-			description: "silent-filter",
-			silenceWarning: "300ms",
-		},
+		{ command: `node -e "setInterval(() => {}, 1000)"`, description: "silent-filter", silenceWarning: "300ms" },
 		undefined,
 		undefined,
 		{ cwd: process.cwd() },
@@ -552,23 +556,56 @@ test("a monitor that produces nothing warns once that its filter may be wrong", 
 	try {
 		assert.match(result.content[0].text, /still silent after 300ms/);
 		await waitFor(() => messages.length > 0);
-		assert.equal(messages.length, 1);
 		assert.match(messages[0], /has produced NO output in 300ms/);
 		assert.match(messages[0], /the filter is probably wrong/);
-		// One-shot: it questions the filter once, it does not nag.
-		await new Promise((resolve) => setTimeout(resolve, 500));
+		// One-shot: pump so a repeat COULD land, then confirm none does.
+		await pump(handlers);
+		await new Promise((resolve) => setTimeout(resolve, 700));
+		await pump(handlers);
 		assert.equal(messages.length, 1);
 	} finally {
 		await stop.execute("stop", { id: result.details.id }, undefined, undefined, {});
 	}
 });
 
-test("a monitor that produces output never warns about silence", async () => {
+test("output with no trailing newline does NOT disarm the warning", async () => {
+	// Regression for the review's finding 1. A short write with no "\n" sits in `carry`;
+	// flush() ignores carry and it is drained only when the process closes. So this output
+	// can never reach the model, and disarming on it would recreate the wait-forever bug.
 	const { tools, handlers, messages } = createHarness();
 	const monitor = tools.get("monitor");
 	const stop = tools.get("background_stop");
 	for (const handler of handlers.get("agent_start") ?? []) await handler();
-	for (const handler of handlers.get("agent_settled") ?? []) await handler();
+	await pump(handlers);
+
+	const result = await monitor.execute(
+		"monitor",
+		{
+			command: `node -e "process.stdout.write('partial-no-newline'); setInterval(() => {}, 1000)"`,
+			description: "carry-only",
+			silenceWarning: "400ms",
+		},
+		undefined,
+		undefined,
+		{ cwd: process.cwd() },
+	);
+	try {
+		// The byte really did arrive: it is in the logfile...
+		await waitFor(() => readFileSync(result.details.logpath, "utf8").includes("partial-no-newline"));
+		// ...and yet the model was never woken by it, so the warning must still fire.
+		await waitFor(() => messages.length > 0);
+		assert.match(messages[0], /has produced NO output in 400ms/);
+	} finally {
+		await stop.execute("stop", { id: result.details.id }, undefined, undefined, {});
+	}
+});
+
+test("a monitor that produces a full line never warns about silence", async () => {
+	const { tools, handlers, messages } = createHarness();
+	const monitor = tools.get("monitor");
+	const stop = tools.get("background_stop");
+	for (const handler of handlers.get("agent_start") ?? []) await handler();
+	await pump(handlers);
 
 	const result = await monitor.execute(
 		"monitor",
@@ -582,41 +619,62 @@ test("a monitor that produces output never warns about silence", async () => {
 		{ cwd: process.cwd() },
 	);
 	try {
-		// Wait for the output itself, which is what disarms the warning...
 		await waitFor(() => messages.length > 0);
-		// ...then sit past the window and confirm nothing further arrives.
-		await new Promise((resolve) => setTimeout(resolve, 2500));
-		assert.equal(messages.length, 1);
 		assert.match(messages[0], /new output/);
+		// Pump and sit past the window so a warning could land if disarm were broken.
+		await pump(handlers);
+		await new Promise((resolve) => setTimeout(resolve, 2200));
+		await pump(handlers);
 		for (const message of messages) assert.doesNotMatch(message, /produced NO output/);
 	} finally {
 		await stop.execute("stop", { id: result.details.id }, undefined, undefined, {});
 	}
 });
 
-test('silenceWarning "off" suppresses the warning, and a bad duration is rejected', async () => {
+test('silenceWarning "off" suppresses the warning that an identical control monitor emits', async () => {
+	// Waiting a second and seeing nothing would prove nothing on its own -- the default is
+	// 10m, so an implementation that ignored "off" would also stay quiet. The control monitor
+	// is what makes this a test: same command, same window, one warns and one must not.
 	const { tools, handlers, messages } = createHarness();
 	const monitor = tools.get("monitor");
 	const stop = tools.get("background_stop");
 	for (const handler of handlers.get("agent_start") ?? []) await handler();
-	for (const handler of handlers.get("agent_settled") ?? []) await handler();
+	await pump(handlers);
 
+	const command = `node -e "setInterval(() => {}, 1000)"`;
 	const off = await monitor.execute(
 		"monitor",
-		{ command: `node -e "setInterval(() => {}, 1000)"`, description: "quiet-ok", silenceWarning: "off" },
+		{ command, description: "quiet-ok", silenceWarning: "off" },
+		undefined,
+		undefined,
+		{ cwd: process.cwd() },
+	);
+	const control = await monitor.execute(
+		"monitor",
+		{ command, description: "control", silenceWarning: "300ms" },
 		undefined,
 		undefined,
 		{ cwd: process.cwd() },
 	);
 	try {
-		await new Promise((resolve) => setTimeout(resolve, PUMP_SETTLE_MS));
-		assert.deepEqual(messages, []);
-		assert.doesNotMatch(off.details.wakeWhen ?? "", /silent/);
+		assert.doesNotMatch(off.content[0].text, /silent/);
+		await waitFor(() => messages.length > 0);
+		await pump(handlers);
+		const all = messages.join("\n");
+		assert.match(all, /\[monitor:control\][^\n]*has produced NO output/);
+		assert.doesNotMatch(all, /quiet-ok/);
 	} finally {
 		await stop.execute("stop", { id: off.details.id }, undefined, undefined, {});
+		await stop.execute("stop", { id: control.details.id }, undefined, undefined, {});
 	}
+});
 
-	// A bare number is as invalid here as it is for bash_background's timeout.
+test("an invalid silenceWarning is rejected without leaking a job or logfile", async () => {
+	const { tools, handlers } = createHarness();
+	const monitor = tools.get("monitor");
+	const list = tools.get("background_list");
+	for (const handler of handlers.get("agent_start") ?? []) await handler();
+
 	const bad = await monitor.execute(
 		"monitor",
 		{ command: "true", description: "bad-duration", silenceWarning: "300" },
@@ -624,5 +682,10 @@ test('silenceWarning "off" suppresses the warning, and a bad duration is rejecte
 		undefined,
 		{ cwd: process.cwd() },
 	);
-	assert.match(bad.output ?? JSON.stringify(bad), /Invalid silenceWarning/);
+	const text = bad.content?.[0]?.text ?? JSON.stringify(bad);
+	assert.match(text, /Invalid silenceWarning/);
+	// Rejected before spawn: nothing registered, and no logfile handed back.
+	assert.equal(bad.details?.logpath, undefined);
+	const listed = await list.execute("list", {}, undefined, undefined, {});
+	assert.doesNotMatch(listed.content?.[0]?.text ?? "", /bad-duration/);
 });

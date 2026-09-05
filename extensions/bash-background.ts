@@ -68,6 +68,8 @@ const MONITOR_MAX_PENDING_BYTES = 8_000;
 // pattern was grepped by hand. So warn ONCE if a live monitor has produced nothing for this
 // long. One-shot, never repeating: the point is to question the filter, not to nag.
 const MONITOR_SILENCE_WARN_MS = 10 * 60 * 1000;
+// Monitors are unbounded, so the only reason to bound this at all is to catch a typo.
+const MAX_SILENCE_WARN_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_BACKGROUND_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
 function formatDurationMs(ms: number) {
@@ -82,19 +84,23 @@ const DURATION_PATTERN = "^[0-9]+(?:\\.[0-9]+)?(?:ms|s|m|h)$";
 const DURATION_RE = /^([0-9]+(?:\.[0-9]+)?)(ms|s|m|h)$/;
 const MILLISECONDS_PER_UNIT = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 } as const;
 
-function parseDurationMs(duration: string): number {
+// `label` and `maxMs` are parameters because this parser serves two callers with different
+// limits: bash_background's timeout is capped at 24h, while monitor's silenceWarning has no
+// natural maximum (monitors are unbounded). Sharing the cap silently rejected "48h" with
+// "bash_background is limited to 24h" on a monitor -- a wrong limit under a wrong name.
+function parseDurationMs(duration: string, label = "timeout", maxMs = MAX_BACKGROUND_TIMEOUT_MS): number {
 	const match = DURATION_RE.exec(duration);
 	if (!match) {
-		throw new Error('Invalid timeout: use an explicit duration such as "30m", "2h", or "500ms"');
+		throw new Error(`Invalid ${label}: use an explicit duration such as "30m", "2h", or "500ms"`);
 	}
-	const timeoutMs = Number(match[1]) * MILLISECONDS_PER_UNIT[match[2] as keyof typeof MILLISECONDS_PER_UNIT];
-	if (!Number.isFinite(timeoutMs) || timeoutMs < 1) {
-		throw new Error("Invalid timeout: duration must be at least 1ms");
+	const ms = Number(match[1]) * MILLISECONDS_PER_UNIT[match[2] as keyof typeof MILLISECONDS_PER_UNIT];
+	if (!Number.isFinite(ms) || ms < 1) {
+		throw new Error(`Invalid ${label}: duration must be at least 1ms`);
 	}
-	if (timeoutMs > MAX_BACKGROUND_TIMEOUT_MS) {
-		throw new Error("Invalid timeout: bash_background is limited to 24h");
+	if (ms > maxMs) {
+		throw new Error(`Invalid ${label}: limited to ${formatDurationMs(maxMs)}`);
 	}
-	return timeoutMs;
+	return ms;
 }
 
 // Watch-shaped commands never exit, so bash_background's wake-on-exit never fires.
@@ -164,7 +170,7 @@ export default function (pi: ExtensionAPI, options?: { promptGateMaxMs?: number 
 	let seq = 0;
 	cleanupOldLogs();
 
-	type DeferredWake = { jobId: string; text: string };
+	type DeferredWake = { jobId: string; text: string; silenceWarning?: boolean };
 
 	// A wake must never start a turn while pi is inside prompt() or compacting.
 	//
@@ -331,8 +337,8 @@ export default function (pi: ExtensionAPI, options?: { promptGateMaxMs?: number 
 		dispatchPendingWakes();
 	});
 
-	function enqueueWake(jobId: string, text: string) {
-		deferredWakes.push({ jobId, text });
+	function enqueueWake(jobId: string, text: string, silenceWarning = false) {
+		deferredWakes.push({ jobId, text, silenceWarning });
 		dispatchPendingWakes();
 	}
 
@@ -361,6 +367,7 @@ export default function (pi: ExtensionAPI, options?: { promptGateMaxMs?: number 
 					`probably wrong -- a grep pattern that never matches is indistinguishable from a quiet run. ` +
 					`Check it against what the source actually emits (e.g. \`grep -c <pattern> <file>\`) rather ` +
 					`than waiting longer. Command: ${job.command}`,
+				true,
 			);
 		}, ms);
 		job.silenceHandle.unref?.();
@@ -463,21 +470,42 @@ export default function (pi: ExtensionAPI, options?: { promptGateMaxMs?: number 
 		const bytes = Buffer.byteLength(line, "utf8") + 1;
 		if (bytes > MONITOR_MAX_PENDING_BYTES || (job.pendingBytes ?? 0) + bytes > MONITOR_MAX_PENDING_BYTES) {
 			job.truncated = true;
+			markDeliverable(job); // an oversized line still wakes: flush() fires on `truncated`
 			return;
 		}
 		job.pending!.push(line);
 		job.pendingBytes = (job.pendingBytes ?? 0) + bytes;
+		markDeliverable(job);
+	}
+
+	// Disarm the silence warning only when output can actually REACH the model. Marking it in
+	// ingest() on any raw chunk was wrong: a short write with no trailing newline sits in
+	// `job.carry`, and flush() returns early unless `pending` is non-empty or `truncated` is set,
+	// while carry is drained only in the close handler. So `printf matched; sleep forever`
+	// disarmed the warning and then never woke anyone -- exactly the wait-forever failure this
+	// feature exists to catch, reintroduced by the disarm. Found by adversarial review of ee3888c.
+	function markDeliverable(job: Job) {
+		if (job.everProduced) return;
+		job.everProduced = true;
+		if (job.silenceHandle) {
+			clearTimeout(job.silenceHandle);
+			job.silenceHandle = undefined;
+		}
+		dropPendingSilenceWake(job.id);
+	}
+
+	// A warning already queued (or waiting out a shut compaction gate) must not be delivered
+	// after it has become false -- it would arrive in the same batch as the very output it
+	// claims is absent, or behind the job's own exit notice.
+	function dropPendingSilenceWake(jobId: string) {
+		for (let i = deferredWakes.length - 1; i >= 0; i--) {
+			const wake = deferredWakes[i]!;
+			if (wake.jobId === jobId && wake.silenceWarning) deferredWakes.splice(i, 1);
+		}
 	}
 
 	function ingest(job: Job, chunk: Buffer) {
 		if (job.stopped || job.done) return;
-		if (!job.everProduced) {
-			job.everProduced = true;
-			if (job.silenceHandle) {
-				clearTimeout(job.silenceHandle);
-				job.silenceHandle = undefined;
-			}
-		}
 		if (job.logfd !== undefined) {
 			try {
 				writeSync(job.logfd, chunk);
@@ -518,6 +546,7 @@ export default function (pi: ExtensionAPI, options?: { promptGateMaxMs?: number 
 		if (job.killHandle) clearTimeout(job.killHandle);
 		if (job.flushTimer) clearInterval(job.flushTimer);
 		if (job.silenceHandle) clearTimeout(job.silenceHandle);
+		dropPendingSilenceWake(job.id);
 		if (job.logfd !== undefined) {
 			try {
 				closeSync(job.logfd);
@@ -675,7 +704,7 @@ export default function (pi: ExtensionAPI, options?: { promptGateMaxMs?: number 
 					silenceMs = 0;
 				} else {
 					try {
-						silenceMs = parseDurationMs(rawSilence);
+						silenceMs = parseDurationMs(rawSilence, "silenceWarning", MAX_SILENCE_WARN_MS);
 					} catch (err) {
 						return errorResult(id, `Invalid silenceWarning: ${String(err instanceof Error ? err.message : err)}`);
 					}
