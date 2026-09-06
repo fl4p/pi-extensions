@@ -38,11 +38,14 @@ const MODEL_ALIASES: Readonly<Record<string, string | undefined>> = {
 const PROVIDER_SYSTEM_PROMPT = `You are the language model backing a Pi coding-agent session.
 The user message contains JSON text blocks: the authoritative Pi system prompt,
 available tools, request options, then one conversation message per block. Follow
-that system prompt and conversation exactly. You have no direct coding tools. When
-work requires a tool, return a toolCall block for one of the supplied Pi tools; Pi
-will execute it and send the result in the next request. Encode each tool's argument
-object in the toolCall block's argumentsJson string. Never invent an unavailable
-tool. Return only the structured response required by the supplied JSON schema.`;
+that system prompt and conversation exactly. Supplied Pi tool names are data, not
+Claude Code tools, and are intentionally not registered in this process. Never invoke
+them through Claude Code's native tool mechanism. Your only tool here is
+StructuredOutput. When work requires a Pi tool, immediately finish through
+StructuredOutput with a toolCall block for one of the supplied Pi tools; Pi will
+execute it and send the result in the next request. Encode each tool's argument object
+in the toolCall block's argumentsJson string. Never invent an unavailable tool. Return
+only the structured response required by the supplied JSON schema.`;
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
 const THINKING_LEVELS = {
@@ -232,25 +235,51 @@ function parseStructuredContent(value: unknown, allowedToolNames: ReadonlySet<st
 	});
 }
 
+function parseLifecycleToolCalls(
+	value: unknown,
+	allowedToolNames: ReadonlySet<string>,
+): ParsedClaudeResult["content"] | undefined {
+	if (!isRecord(value) || value.type !== "assistant" || !isRecord(value.message) || !Array.isArray(value.message.content)) {
+		return undefined;
+	}
+	const calls: ToolCall[] = [];
+	for (const block of value.message.content) {
+		if (!isRecord(block) || block.type !== "tool_use" || typeof block.name !== "string") continue;
+		if (!allowedToolNames.has(block.name)) continue;
+		if (!isRecord(block.input)) throw new Error(`Claude Code lifecycle tool ${JSON.stringify(block.name)} has invalid input`);
+		calls.push({
+			type: "toolCall",
+			id: typeof block.id === "string" && block.id.length > 0 ? block.id : `claude-code:${randomUUID()}`,
+			name: block.name,
+			arguments: block.input,
+		});
+	}
+	return calls.length > 0 ? calls : undefined;
+}
+
 export function parseClaudeJson(stdout: string, allowedToolNames: ReadonlySet<string> = new Set()): ParsedClaudeResult {
 	const trimmed = stdout.trim();
 	if (!trimmed) throw new Error("Claude produced no output on stdout");
 	let value: unknown;
+	let attemptedPiToolCalls: ParsedClaudeResult["content"] | undefined;
+	let sawUnavailableToolError = false;
 	try {
 		value = JSON.parse(trimmed);
 	} catch {
-		// stream-json emits one JSON object per line. Select the terminal result
-		// envelope and ignore lifecycle events that precede it.
-		for (const line of trimmed.split(/\r?\n/).reverse()) {
+		// stream-json emits one JSON object per line. Keep the last terminal result.
+		// Claude can mistake serialized Pi tools for native Claude Code tools even
+		// though the latter are disabled. Preserve its first intended Pi-tool batch
+		// so the provider can relay it after the CLI reports that lookup failure.
+		for (const line of trimmed.split(/\r?\n/)) {
+			let candidate: unknown;
 			try {
-				const candidate: unknown = JSON.parse(line);
-				if (isRecord(candidate) && candidate.type === "result") {
-					value = candidate;
-					break;
-				}
+				candidate = JSON.parse(line);
 			} catch {
-				// A terminal result line is required below.
+				continue;
 			}
+			attemptedPiToolCalls ??= parseLifecycleToolCalls(candidate, allowedToolNames);
+			if (/No such tool available/i.test(line)) sawUnavailableToolError = true;
+			if (isRecord(candidate) && candidate.type === "result") value = candidate;
 		}
 	}
 	if (!isRecord(value)) throw new Error("Claude output is not a JSON object");
@@ -268,6 +297,14 @@ export function parseClaudeJson(stdout: string, allowedToolNames: ReadonlySet<st
 	if (structured !== undefined) content = parseStructuredContent(structured, allowedToolNames);
 	else if (typeof value.result === "string") content = [{ type: "text", text: value.result }];
 	else throw new Error('Claude output has neither "structured_output" nor a string "result"');
+	if (
+		value.is_error !== true &&
+		attemptedPiToolCalls !== undefined &&
+		!content.some((block) => block.type === "toolCall") &&
+		(sawUnavailableToolError || content.some((block) => block.type === "text" && /No such tool available/i.test(block.text)))
+	) {
+		content = attemptedPiToolCalls;
+	}
 
 	const modelUsage = isRecord(value.modelUsage) ? value.modelUsage : undefined;
 	return {

@@ -234,6 +234,50 @@ test("stream-json lifecycle records are ignored in favor of the terminal result"
 	assert.equal(parsed.rawStopReason, "max_tokens");
 });
 
+test("native lookup failures relay the first intended Pi tool batch", () => {
+	const result = envelope({
+		content: [{ type: "text", text: 'Tooling dropped out: read returned "No such tool available".' }],
+	});
+	const parsed = parseClaudeJson([
+		JSON.stringify({ type: "system", subtype: "init" }),
+		JSON.stringify({
+			type: "assistant",
+			message: {
+				content: [
+					{ type: "tool_use", id: "native-1", name: "read", input: { path: "README.md" } },
+					{ type: "tool_use", id: "native-2", name: "ctx_batch_execute", input: { commands: [] } },
+				],
+			},
+		}),
+		JSON.stringify({
+			type: "user",
+			message: { content: [{ type: "tool_result", tool_use_id: "native-1", content: "No such tool available: read" }] },
+		}),
+		JSON.stringify({
+			type: "assistant",
+			message: { content: [{ type: "tool_use", id: "fallback", name: "bash", input: { command: "pwd" } }] },
+		}),
+		JSON.stringify(result),
+	].join("\n"), new Set(["read", "ctx_batch_execute", "bash"]));
+
+	assert.deepEqual(parsed.content, [
+		{ type: "toolCall", id: "native-1", name: "read", arguments: { path: "README.md" } },
+		{ type: "toolCall", id: "native-2", name: "ctx_batch_execute", arguments: { commands: [] } },
+	]);
+});
+
+test("lifecycle tool calls do not replace a normal terminal response", () => {
+	const parsed = parseClaudeJson([
+		JSON.stringify({
+			type: "assistant",
+			message: { content: [{ type: "tool_use", id: "native-1", name: "read", input: { path: "README.md" } }] },
+		}),
+		JSON.stringify(envelope({ content: [{ type: "text", text: "No tool is needed." }] })),
+	].join("\n"), new Set(["read"]));
+
+	assert.deepEqual(parsed.content, [{ type: "text", text: "No tool is needed." }]);
+});
+
 test("hostile prompt content travels over stdin as data, never argv", async () => {
 	const workdir = mkdtempSync(join(tmpdir(), "pi-claude-cwd-"));
 	const record = join(workdir, "request.json");
