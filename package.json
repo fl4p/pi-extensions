@@ -19,7 +19,8 @@
       "./extensions/persistent-history.ts",
       "./extensions/turn-timer.ts",
       "./extensions/skill-reread.ts",
-      "./extensions/auto-continue.ts"
+      "./extensions/auto-continue.ts",
+      "./extensions/ctx-exec-timeout.ts"
     ]
   },
   "keywords": [
