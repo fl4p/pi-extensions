@@ -6,6 +6,7 @@ import {
 	mkdtempSync,
 	openSync,
 	readFileSync,
+	rmSync,
 	statSync,
 	unlinkSync,
 	utimesSync,
@@ -259,6 +260,18 @@ test("monitor holds busy output locally and releases one batch after agent_settl
 	}
 });
 
+// The descriptor this process holds open on `path`, found by inode.
+function openDescriptorOf(path) {
+	const { dev, ino } = statSync(path);
+	for (let fd = 0; fd < 1024; fd += 1) {
+		try {
+			const st = fstatSync(fd);
+			if (st.dev === dev && st.ino === ino) return fd;
+		} catch {}
+	}
+	return undefined;
+}
+
 test("background_stop closes the log once, so the exit cannot close a reused descriptor", async () => {
 	// pi crashed with an uncaught `read EBADF` on a Pipe: background_stop closed the
 	// job's log descriptor, a bash tool call running in parallel spawned a child whose
@@ -273,22 +286,31 @@ test("background_stop closes the log once, so the exit cannot close a reused des
 		undefined,
 		{ cwd: process.cwd() },
 	);
-	const scratch = join(mkdtempSync(join(tmpdir(), "bg-fd-")), "reused");
+	const scratchDir = mkdtempSync(join(tmpdir(), "bg-fd-"));
 	let reused;
 	try {
+		const logfd = openDescriptorOf(result.details.logpath);
+		assert.notEqual(logfd, undefined, "the monitor's log descriptor was not found");
 		await stop.execute("stop", { id: result.details.id }, undefined, undefined, { cwd: process.cwd() });
-		// The lowest free number is the log descriptor stop just released.
-		reused = openSync(scratch, "w");
+		reused = openSync(join(scratchDir, "reused"), "w");
+		// Without this, a lower descriptor freed elsewhere would take the slot and the
+		// test would pass with the bug present.
+		assert.equal(reused, logfd, "precondition: the scratch file must reuse the log's descriptor");
 		await waitFor(() => !isAlive(result.details.pid), 4000);
-		await new Promise((resolve) => setTimeout(resolve, 200)); // let the exit handler run
-		assert.doesNotThrow(() => fstatSync(reused), "the job's exit closed a descriptor it no longer owned");
+		// The job's close handler runs after the process is gone; watch the reused
+		// descriptor long enough for it to have run.
+		const deadline = Date.now() + 1000;
+		while (Date.now() < deadline) {
+			assert.doesNotThrow(() => fstatSync(reused), "the job's exit closed a descriptor it no longer owned");
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
 	} finally {
 		if (reused !== undefined) {
 			try {
 				closeSync(reused);
 			} catch {}
 		}
-		removeLog(scratch);
+		rmSync(scratchDir, { recursive: true, force: true });
 		removeLog(result.details.logpath);
 	}
 });
