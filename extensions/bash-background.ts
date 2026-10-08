@@ -539,6 +539,21 @@ export default function (pi: ExtensionAPI, options?: { promptGateMaxMs?: number 
 		dispatchPendingWakes();
 	}
 
+	// Close a job's log descriptor exactly once. background_stop closes it and the
+	// killed job's exit runs finish() later; closing the same NUMBER twice closes
+	// whatever reused it in between (a parallel bash call's pipe), and pi then dies
+	// on an uncaught `read EBADF`.
+	function closeLog(job: Job) {
+		const fd = job.logfd;
+		if (fd === undefined) return;
+		job.logfd = undefined;
+		try {
+			closeSync(fd);
+		} catch {
+			/* ignore */
+		}
+	}
+
 	function finish(job: Job, text: string) {
 		if (job.done) return;
 		job.done = true;
@@ -547,13 +562,7 @@ export default function (pi: ExtensionAPI, options?: { promptGateMaxMs?: number 
 		if (job.flushTimer) clearInterval(job.flushTimer);
 		if (job.silenceHandle) clearTimeout(job.silenceHandle);
 		dropPendingSilenceWake(job.id);
-		if (job.logfd !== undefined) {
-			try {
-				closeSync(job.logfd);
-			} catch {
-				/* ignore */
-			}
-		}
+		closeLog(job);
 		jobs.delete(job.id);
 		scheduleLogCleanup(job.logpath);
 		if (!job.stopped) enqueueWake(job.id, text);
@@ -811,13 +820,7 @@ export default function (pi: ExtensionAPI, options?: { promptGateMaxMs?: number 
 			}
 			if (job.timeoutHandle) clearTimeout(job.timeoutHandle);
 			if (job.flushTimer) clearInterval(job.flushTimer);
-			if (job.logfd !== undefined) {
-				try {
-					closeSync(job.logfd);
-				} catch {
-					/* ignore */
-				}
-			}
+			closeLog(job);
 			killTree(job);
 			jobs.delete(params.id);
 			return {

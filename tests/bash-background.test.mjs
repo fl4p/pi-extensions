@@ -1,5 +1,16 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import {
+	closeSync,
+	existsSync,
+	fstatSync,
+	mkdtempSync,
+	openSync,
+	readFileSync,
+	statSync,
+	unlinkSync,
+	utimesSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -244,6 +255,40 @@ test("monitor holds busy output locally and releases one batch after agent_settl
 		assert.match(messages[0], /second/);
 	} finally {
 		await stopAndWait(stop, result);
+		removeLog(result.details.logpath);
+	}
+});
+
+test("background_stop closes the log once, so the exit cannot close a reused descriptor", async () => {
+	// pi crashed with an uncaught `read EBADF` on a Pipe: background_stop closed the
+	// job's log descriptor, a bash tool call running in parallel spawned a child whose
+	// pipe took the freed number, and the killed job's exit closed that number again.
+	const { tools } = createHarness();
+	const monitor = tools.get("monitor");
+	const stop = tools.get("background_stop");
+	const result = await monitor.execute(
+		"monitor",
+		{ command: `node -e "setInterval(() => {}, 1000)"`, description: "fd-reuse" },
+		undefined,
+		undefined,
+		{ cwd: process.cwd() },
+	);
+	const scratch = join(mkdtempSync(join(tmpdir(), "bg-fd-")), "reused");
+	let reused;
+	try {
+		await stop.execute("stop", { id: result.details.id }, undefined, undefined, { cwd: process.cwd() });
+		// The lowest free number is the log descriptor stop just released.
+		reused = openSync(scratch, "w");
+		await waitFor(() => !isAlive(result.details.pid), 4000);
+		await new Promise((resolve) => setTimeout(resolve, 200)); // let the exit handler run
+		assert.doesNotThrow(() => fstatSync(reused), "the job's exit closed a descriptor it no longer owned");
+	} finally {
+		if (reused !== undefined) {
+			try {
+				closeSync(reused);
+			} catch {}
+		}
+		removeLog(scratch);
 		removeLog(result.details.logpath);
 	}
 });
