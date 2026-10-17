@@ -20,6 +20,7 @@
       "./extensions/turn-timer.ts",
       "./extensions/skill-reread.ts",
       "./extensions/auto-continue.ts",
+      "./extensions/kb-push.ts",
       "./extensions/ctx-exec-timeout.ts",
       "./extensions/prompt-compact.ts"
     ]
