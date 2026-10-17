@@ -296,21 +296,51 @@ ln -s /path/to/pi-extensions/extensions/auto-continue.ts ~/.pi/agent/extensions/
 
 Then restart pi (or `/reload`).
 
+### kb-push
+
+Pushes the relevant `~/dev/kb` index lines into the session when a bash command touches a domain's tooling.
+
+The knowledge base is pull: every harness loads a stanza telling the agent to read `~/dev/kb/INDEX.md` before deriving a claim, and nothing makes it do so (observed: four wrong hypotheses on a silent ESP32-S3 while a kb note described the exact symptom). Claude Code closes the gap with a PreToolUse hook, `~/.claude/hooks/kb-push.sh`; pi reads no Claude Code hooks.
+
+On every bash `tool_call` this extension runs that same script with Claude Code's hook JSON on stdin, keyed by session id `pi-<id>`, and injects any `additionalContext` it returns as a `kb-push` custom message. The trigger table (`esptool`, `pio`, `chirpstack`, …) and the once-per-domain-per-session stamps live only in the script, so there is one copy of the rule. The message is steered: it arrives after the batch's tool results and before the next model call, without an extra model call. (`triggerTurn: false`, as skill-reread uses, would be wrong here — mid-run pi appends such a message outside the running loop's context.) If another extension terminates the batch, the queued message still costs one follow-up model call.
+
+The extension never blocks or edits a command. The script gets 2 s (it takes ~20 ms); a missing script, timeout, non-zero exit, or unparseable output means no message. On a machine without the script it does nothing.
+
+#### Install
+
+```bash
+ln -s /path/to/pi-extensions/extensions/kb-push.ts ~/.pi/agent/extensions/kb-push.ts
+```
+
+Then restart pi (or `/reload`).
+
 ### ctx-exec-timeout
 
 Supplies the default `timeout` that context-mode's exec tools lack on pi. A `ctx_execute` / `ctx_execute_file` / `ctx_batch_execute` call that omits `timeout` is unbounded at **every** layer under pi, so one hung command blocks the turn until the session is killed — measured 2026-09-10, a recursive `grep -rn` over `~/dev` sat for 75 minutes with no tool result and Esc doing nothing.
 
-Three deliberate upstream decisions compose into that hang: context-mode's `resolveExecTimeout()` returns undefined for every host except Antigravity CLI (on the premise that "every other host enforces its own RPC timeout"), its executor arms no timer when the timeout is undefined ([#406](https://github.com/mksglu/context-mode/issues/406) — long builds must not be cut off), and pi's MCP bridge forwards `tools/call` with `Number.POSITIVE_INFINITY` ([#643](https://github.com/mksglu/context-mode/issues/643)) while dropping the `AbortSignal` pi hands it, so cancelling never reaches the child either. Upstream: [#959](https://github.com/mksglu/context-mode/issues/959) (bug), [PR #1147](https://github.com/mksglu/context-mode/pull/1147) (this default, per host), [PR #1029](https://github.com/mksglu/context-mode/pull/1029) (the cancellation half).
+Three deliberate upstream decisions compose into that hang: context-mode's `resolveExecTimeout()` returns undefined for every host except Antigravity CLI (on the premise that "every other host enforces its own RPC timeout"), its executor arms no timer when the timeout is undefined ([#406](https://github.com/mksglu/context-mode/issues/406) — long builds must not be cut off), and context-mode's own pi adapter (`build/adapters/pi/mcp-bridge.js` — not pi code) forwards `tools/call` with `Number.POSITIVE_INFINITY` ([#643](https://github.com/mksglu/context-mode/issues/643)) while dropping the `AbortSignal` pi hands it, so cancelling never reaches the child either. Upstream: [#959](https://github.com/mksglu/context-mode/issues/959) (bug), [PR #1147](https://github.com/mksglu/context-mode/pull/1147) (a per-host default), [PR #1029](https://github.com/mksglu/context-mode/pull/1029) (the cancellation half).
 
-The fix lives here rather than in a patched bundle because `pi update` and every context-mode release overwrite `~/.pi/agent/npm/node_modules/context-mode` wholesale. An explicit `timeout` in the tool arguments is honored by every context-mode version on every host — that path predates the bug — so supplying it from our side is version-proof and strictly narrower than editing their code. It stays correct, if redundant, once upstream ships a default.
+The fix lives here rather than in a patched bundle because `pi update` and every context-mode release overwrite `~/.pi/agent/npm/node_modules/context-mode` wholesale. An explicit `timeout` in the tool arguments is honored by context-mode 1.0.169 and by the PR #1147 branch (the two versions checked), so supplying it from our side survives updates and is narrower than editing their code.
 
-Budget: 10 minutes per call, matching PR #1147, which clears the 2–5 minute test suites and builds that #643 protected. `ctx_batch_execute` is scaled by command count (capped at 30 minutes) because released context-mode spends an explicit timeout as a *shared* budget across a serial batch, and a truncated batch still reports `Executed N commands` with killed commands rendered as `(no output)`. An explicit `timeout` from the model is never overridden. `CTX_EXEC_DEFAULT_TIMEOUT_MS=<ms>` retunes it; `CTX_EXEC_DEFAULT_TIMEOUT_MS=off` disables it. An unusable value falls back to the built-in default rather than to "unbounded", and values above 2^31-1 are refused because `setTimeout` would wrap them to a ~1ms delay (`~/dev/kb/tooling/settimeout-delay-over-int32-fires-immediately.md`).
+Budget: 10 minutes per call, matching PR #1147, which clears the 2–5 minute test suites and builds that #643 protected. A timeout the model passes itself is never overridden — unless it exceeds 2^31-1 ms, which `setTimeout` would wrap to a ~1ms delay, so it is replaced by the default. `CTX_EXEC_DEFAULT_TIMEOUT_MS=<ms>` retunes the budget and `CTX_EXEC_DEFAULT_TIMEOUT_MS=off` disables the extension; an unusable value falls back to the default rather than to "unbounded".
 
-Verified in a live pi session: with an 8s budget a `sleep 300` call returns `Execution timed out after 8000ms`; with the extension off the same call runs to completion; at the real default a legitimate 20s command is untouched.
+**`ctx_batch_execute` is cut silently, so the cut is announced.** Released context-mode spends an explicit timeout as a *shared* budget across a serial batch (concurrency omitted or 1), and a truncated batch still reports `Executed N commands`: a killed command renders as `(no output)`, later ones never run, and the skip markers are indexed but never returned. The serial budget is therefore scaled by command count (capped at 30 minutes), and when an injected batch budget is used up the extension appends a notice to the tool result telling the model the output may be incomplete and how to re-run it. With concurrency > 1 the budget already applies per command and is not scaled. A batch the model gave its own `timeout` gets no notice — that budget is the caller's to judge.
+
+Known limits:
+
+- **Not redundant once upstream ships PR #1147.** That PR makes a host default apply per command in a serial batch, but only when the call carries no `timeout` — so while this extension is active, batches keep the older shared-budget semantics, and upstream's `CONTEXT_MODE_DEFAULT_EXEC_TIMEOUT_MS` has no effect. Remove this extension (or at least its batch branch) when a context-mode release includes that fix.
+- **Sub-agents with an explicit extension list skip it.** A child pi launched with `--no-extensions` plus explicit `--extension` paths — which the subagent extension does when an agent definition declares `extensions:` — loads only those paths. Any such agent that also loads context-mode must list `ctx-exec-timeout` too. No agent definition on this machine does that as of 2026-09-11.
+- **The injected budget is invisible in the TUI and the session file**, which show the arguments as the model sent them. It surfaces in context-mode's own timeout error (`Execution timed out after 600000ms`) and in the batch notice.
+
+Verified in a live pi session (pi 0.84.3, context-mode 1.0.169): with an 8s budget a `sleep 300` call returns `Execution timed out after 8000ms`; with the extension off, a 20s `sleep` runs to completion rather than being cut at 8s; at the real default a legitimate 20s command is untouched; and with an 8s budget plus `background: true` the call detaches after 8s and returns success instead of hanging.
+
+#### Install
 
 ```bash
 ln -s /path/to/pi-extensions/extensions/ctx-exec-timeout.ts ~/.pi/agent/extensions/ctx-exec-timeout.ts
 ```
+
+Then restart pi (or `/reload`).
 
 ## Development
 
