@@ -23,7 +23,8 @@
       "./extensions/kb-push.ts",
       "./extensions/ctx-exec-timeout.ts",
       "./extensions/prompt-compact.ts",
-      "./extensions/ctx-slim.ts"
+      "./extensions/ctx-slim.ts",
+      "./extensions/hide-tools.ts"
     ]
   },
   "keywords": [
