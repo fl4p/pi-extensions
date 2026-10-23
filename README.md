@@ -342,6 +342,24 @@ ln -s /path/to/pi-extensions/extensions/ctx-exec-timeout.ts ~/.pi/agent/extensio
 
 Then restart pi (or `/reload`).
 
+### ctx-slim
+
+Shrinks context-mode's tool schemas in every provider request. context-mode 1.0.169's 11 tools carry docs-page descriptions (philosophy, WHEN / WHEN NOT / RETURNS sections, worked examples, ranking internals): 7,307 tokens (Qwen3.5 tokenizer) of a 29.7k-token "hi" request, captured 2026-10-23 with pi 0.84.3 against `local-inference/mock_endpoint.py`. With the extension the six remaining tools take 2,171 tokens.
+
+- **Five maintenance tools are removed from the payload:** `ctx_doctor` and `ctx_stats` (still available as `/ctx-doctor` and `/ctx-stats`), `ctx_upgrade` (`pi update` does it), `ctx_insight` (opens a hosted dashboard) and `ctx_purge` (destructive). pi still has them registered, so a call to one is blocked in `tool_call`.
+- **The other six get short descriptions.** Parameter types, enums, defaults and `required` lists are unchanged; only description strings are replaced.
+- **Drift guard:** a tool is rewritten only when its parameter names exactly match the table. A release that adds, renames or drops a parameter keeps that tool's original schema.
+
+It rewrites the payload in `before_provider_request` (OpenAI chat and responses, Anthropic and Google tool shapes) rather than patching the bundle, which `pi update` overwrites. The rewrite is deterministic, so prompt caches keep working. `CTX_SLIM=off` disables it.
+
+The package's `ctx-*` skills (about 700 more tokens, mostly slash-command wrappers for the removed tools) are not touched here; filter them in `settings.json` with `{"source": "npm:context-mode", "skills": ["skills/context-mode"]}`.
+
+#### Install
+
+```bash
+ln -s /path/to/pi-extensions/extensions/ctx-slim.ts ~/.pi/agent/extensions/ctx-slim.ts
+```
+
 ## Development
 
 ```bash
