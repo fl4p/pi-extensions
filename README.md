@@ -360,6 +360,19 @@ The package's `ctx-*` skills (about 700 more tokens, mostly slash-command wrappe
 ln -s /path/to/pi-extensions/extensions/ctx-slim.ts ~/.pi/agent/extensions/ctx-slim.ts
 ```
 
+### hide-tools
+
+Deactivates the tools named in `PI_HIDE_TOOLS` (comma-separated) with `pi.setActiveTools`, at session start and before every agent turn. pi then also drops their prompt lines and refuses calls to them. Unset or empty hides nothing.
+
+Used for pi-memory's ten store-maintenance tools: `memory_status`, `memory_check`, `memory_repair`, `memory_refresh`, `memory_dream`, `memory_review`, `memory_maintain`, `memory_list`, `memory_why` and `memory_recall_feedback`. They cost 1,322 tokens per request and were called 74 times in all of the Mac's pi history (measured 2026-10-23). All of them remain available to the user as `/memory-*` commands.
+
+#### Install
+
+```bash
+ln -s /path/to/pi-extensions/extensions/hide-tools.ts ~/.pi/agent/extensions/hide-tools.ts
+export PI_HIDE_TOOLS=memory_status,memory_check,memory_repair,memory_refresh,memory_dream,memory_review,memory_maintain,memory_list,memory_why,memory_recall_feedback
+```
+
 ## Development
 
 ```bash
