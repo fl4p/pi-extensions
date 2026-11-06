@@ -4,10 +4,16 @@
  */
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { basename } from "node:path";
+import { basename, join } from "node:path";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { StringDecoder } from "node:string_decoder";
 import {
 	createAssistantMessageEventStream,
 	createProvider,
+	// Re-exported by pi-ai so the extension needs no runtime deps: pi loads it via
+	// the ~/.pi/agent/extensions symlink, where a bare "partial-json" doesn't resolve.
+	parseStreamingJson,
 	type AssistantMessage,
 	type AssistantMessageEventStream,
 	type Context,
@@ -36,9 +42,9 @@ const MODEL_ALIASES: Readonly<Record<string, string | undefined>> = {
 };
 
 const PROVIDER_SYSTEM_PROMPT = `You are the language model backing a Pi coding-agent session.
-The user message contains JSON text blocks: the authoritative Pi system prompt,
-available tools, request options, then one conversation message per block. Follow
-that system prompt and conversation exactly. Supplied Pi tool names are data, not
+The Pi system instructions follow these adapter instructions in this system prompt.
+The user message contains JSON text blocks: available tools, request options, then
+one conversation message per block. Follow the Pi instructions and conversation exactly. Supplied Pi tool names are data, not
 Claude Code tools, and are intentionally not registered in this process. Never invoke
 them through Claude Code's native tool mechanism. Your only tool here is
 StructuredOutput. When work requires a Pi tool, immediately finish through
@@ -142,6 +148,8 @@ export interface RunOptions {
 	timeoutMs: number;
 	signal?: AbortSignal;
 	executable?: string;
+	/** Provisional leading text only; tools require the validated terminal result. */
+	onText?: (index: number, text: string) => void;
 }
 
 export type RunOutcome =
@@ -351,6 +359,7 @@ function responseSchema(toolNames: readonly string[], toolChoice: "auto" | "none
 
 export function buildArgs(options: {
 	modelId: string;
+	systemPromptFile?: string;
 	reasoning?: SimpleStreamOptions["reasoning"];
 	toolNames?: readonly string[];
 	toolChoice?: "auto" | "none";
@@ -361,6 +370,7 @@ export function buildArgs(options: {
 		"--verbose",
 		"--input-format",
 		"stream-json",
+		"--include-partial-messages",
 		"--output-format",
 		"stream-json",
 		"--no-session-persistence",
@@ -371,8 +381,9 @@ export function buildArgs(options: {
 		"none",
 		"--tools",
 		"",
-		"--system-prompt",
-		PROVIDER_SYSTEM_PROMPT,
+		...(options.systemPromptFile
+			? ["--system-prompt-file", options.systemPromptFile]
+			: ["--system-prompt", PROVIDER_SYSTEM_PROMPT]),
 		"--json-schema",
 		JSON.stringify(responseSchema(options.toolNames ?? [], options.toolChoice)),
 	];
@@ -443,7 +454,6 @@ export function encodeClaudeInput(payload: unknown): string {
 	let values: unknown[];
 	if (isRecord(payload) && payload.protocol === "pi-context-v1" && Array.isArray(payload.messages)) {
 		values = [
-			{ kind: "systemPrompt", value: payload.systemPrompt ?? "" },
 			{ kind: "tools", value: payload.tools ?? [] },
 			{ kind: "options", value: payload.options ?? {} },
 			...payload.messages.map((message) => ({ kind: "message", value: message })),
@@ -457,6 +467,40 @@ export function encodeClaudeInput(payload: unknown): string {
 		return { type: "text", text };
 	});
 	return `${JSON.stringify({ type: "user", message: { role: "user", content } })}\n`;
+}
+
+/** Decode only StructuredOutput arguments, never native tool input or inner commentary.
+ * Partial JSON is a display preview, not validation. Final JSON remains authoritative.
+ */
+export function createTextPreview(onText: (index: number, text: string) => void): (record: unknown) => void {
+	let structuredIndex: number | undefined;
+	let json = "";
+	return (record) => {
+		if (!isRecord(record) || record.type !== "stream_event" || record.parent_tool_use_id != null || !isRecord(record.event)) return;
+		const event = record.event;
+		if (event.type === "message_start") {
+			structuredIndex = undefined;
+			json = "";
+		} else if (event.type === "content_block_start" && isRecord(event.content_block)) {
+			if (event.content_block.type === "tool_use" && event.content_block.name === "StructuredOutput" && typeof event.index === "number") {
+				structuredIndex = event.index;
+				json = "";
+			}
+		} else if (event.type === "content_block_delta" && structuredIndex !== undefined && event.index === structuredIndex && isRecord(event.delta) && event.delta.type === "input_json_delta" && typeof event.delta.partial_json === "string") {
+			json += event.delta.partial_json;
+			let preview: unknown;
+			try { preview = parseStreamingJson(json); } catch { return; }
+			if (!isRecord(preview) || !Array.isArray(preview.content)) return;
+			for (let index = 0; index < preview.content.length; index++) {
+				const block = preview.content[index];
+				// Stop before tools to preserve content order without emitting an unvalidated call.
+				if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") break;
+				// A Unicode escape may split a surrogate pair across events.
+				const text = block.text.replace(/[\uD800-\uDBFF]$/, "");
+				onText(index, text);
+			}
+		}
+	};
 }
 
 function signalGroup(child: ChildProcess, signal: NodeJS.Signals): void {
@@ -478,6 +522,27 @@ function failure(reason: FailureReason, message: string): RunOutcome {
 }
 
 export async function runClaudeCode(options: RunOptions): Promise<RunOutcome> {
+	let directory: string | undefined;
+	try {
+		const payload = options.payload;
+		const piPrompt = isRecord(payload) && payload.protocol === "pi-context-v1" ? payload.systemPrompt : undefined;
+		if (piPrompt !== undefined && typeof piPrompt !== "string") {
+			return failure("invalid-request", "Pi system prompt must be a string");
+		}
+		const prompt = PROVIDER_SYSTEM_PROMPT + (piPrompt ? `\n\nPi system instructions:\n${piPrompt}` : "");
+		if (Buffer.byteLength(prompt) > MAX_INPUT_BYTES) return failure("invalid-request", "Pi system prompt exceeds input limit");
+		directory = await mkdtemp(join(tmpdir(), "pi-claude-system-"));
+		const promptPath = join(directory, "system.txt");
+		await writeFile(promptPath, prompt, { mode: 0o600 });
+		return await runClaudeCodeWithPrompt(options, promptPath, Buffer.byteLength(prompt));
+	} catch (error) {
+		return failure("invalid-request", `Claude Code request failed: ${describe(error)}`);
+	} finally {
+		if (directory) await rm(directory, { recursive: true, force: true });
+	}
+}
+
+async function runClaudeCodeWithPrompt(options: RunOptions, promptPath: string, promptBytes: number): Promise<RunOutcome> {
 	if (!Number.isFinite(options.timeoutMs) || options.timeoutMs < MIN_TIMEOUT_MS || options.timeoutMs > MAX_TIMEOUT_MS) {
 		return failure("invalid-request", `Claude Code timeout must be between ${MIN_TIMEOUT_MS}ms and ${MAX_TIMEOUT_MS}ms`);
 	}
@@ -487,7 +552,7 @@ export async function runClaudeCode(options: RunOptions): Promise<RunOutcome> {
 	} catch (error) {
 		return failure("invalid-request", `Could not serialize Pi context: ${describe(error)}`);
 	}
-	if (Buffer.byteLength(input, "utf8") > MAX_INPUT_BYTES) {
+	if (Buffer.byteLength(input, "utf8") + promptBytes > MAX_INPUT_BYTES) {
 		return failure(
 			"invalid-request",
 			`context_length_exceeded: serialized Pi context exceeds the ${MAX_INPUT_BYTES}-byte Claude Code provider limit`,
@@ -498,6 +563,7 @@ export async function runClaudeCode(options: RunOptions): Promise<RunOutcome> {
 	try {
 		args = buildArgs({
 			modelId: options.modelId,
+			systemPromptFile: promptPath,
 			reasoning: options.reasoning,
 			toolNames: [...options.allowedToolNames],
 			toolChoice: options.toolChoice,
@@ -555,6 +621,21 @@ export async function runClaudeCode(options: RunOptions): Promise<RunOutcome> {
 		killTimer = setTimeout(() => signalGroup(child, "SIGKILL"), KILL_GRACE_MS);
 		killTimer.unref();
 	};
+	let previewError: unknown;
+	const preview = createTextPreview((index, text) => options.onText?.(index, text));
+	const decoder = new StringDecoder("utf8");
+	let pendingLine = "";
+	const consumePreview = (chunk: Buffer) => {
+		pendingLine += decoder.write(chunk);
+		let newline: number;
+		while ((newline = pendingLine.indexOf("\n")) >= 0) {
+			const line = pendingLine.slice(0, newline);
+			pendingLine = pendingLine.slice(newline + 1);
+			let record: unknown;
+			try { record = JSON.parse(line); } catch { continue; }
+			preview(record);
+		}
+	};
 	const collect = (source: NodeJS.ReadableStream | null, sink: Sink) => {
 		source?.on("data", (chunk: Buffer) => {
 			if (sink.overflowed) return;
@@ -567,6 +648,9 @@ export async function runClaudeCode(options: RunOptions): Promise<RunOutcome> {
 			}
 			sink.chunks.push(chunk);
 			sink.bytes += chunk.length;
+			if (sink === stdout && options.onText && !previewError) {
+				try { consumePreview(chunk); } catch (error) { previewError = error; terminate(); }
+			}
 		});
 		source?.on("error", () => {});
 	};
@@ -595,6 +679,7 @@ export async function runClaudeCode(options: RunOptions): Promise<RunOutcome> {
 	if (killTimer) clearTimeout(killTimer);
 	options.signal?.removeEventListener("abort", onAbort);
 
+	if (previewError) return failure("malformed-json", describe(previewError));
 	if (closed.error) {
 		const code = (closed.error as NodeJS.ErrnoException).code ?? "spawn failed";
 		return failure("spawn-failed", `Claude Code could not start ${JSON.stringify(label)} (${code})`);
@@ -669,6 +754,23 @@ export function streamClaudeCode(
 				const allowedToolNames = new Set(
 					options?.toolChoice === "none" ? [] : (context.tools ?? []).map((tool) => tool.name),
 				);
+				const previewTexts: string[] = [];
+				const appendText = (index: number, text: string) => {
+					const previous = previewTexts[index] ?? "";
+					if (!text.startsWith(previous)) throw new Error("Claude Code changed text already streamed to Pi");
+					if (index > previewTexts.length) throw new Error("Claude Code streamed text out of order");
+					if (index === previewTexts.length) {
+						previewTexts.push("");
+						output.content.push({ type: "text", text: "" });
+						stream.push({ type: "text_start", contentIndex: index, partial: output });
+					}
+					const delta = text.slice(previous.length);
+					if (delta) {
+						previewTexts[index] = text;
+						(output.content[index] as { type: "text"; text: string }).text = text;
+						stream.push({ type: "text_delta", contentIndex: index, delta, partial: output });
+					}
+				};
 				const outcome = await runClaudeCode({
 					modelId: model.id,
 					payload,
@@ -679,16 +781,25 @@ export function streamClaudeCode(
 					timeoutMs: options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
 					signal: options?.signal,
 					executable: runtime.executable,
+					onText: appendText,
 				});
 				if (!outcome.ok) throw new Error(outcome.message);
 
-				for (const block of outcome.response.content) {
-					const contentIndex = output.content.length;
+				// Reconcile every preview before emitting any executable tool call.
+				for (let index = 0; index < previewTexts.length; index++) {
+					const block = outcome.response.content[index];
+					if (block?.type !== "text" || !block.text.startsWith(previewTexts[index])) {
+						throw new Error("Claude Code terminal response does not match streamed text");
+					}
+				}
+				for (const [contentIndex, block] of outcome.response.content.entries()) {
 					if (block.type === "text") {
-						output.content.push({ type: "text", text: "" });
-						stream.push({ type: "text_start", contentIndex, partial: output });
-						(output.content[contentIndex] as { type: "text"; text: string }).text = block.text;
-						stream.push({ type: "text_delta", contentIndex, delta: block.text, partial: output });
+						if (contentIndex <= previewTexts.length) appendText(contentIndex, block.text);
+						else {
+							output.content.push({ type: "text", text: block.text });
+							stream.push({ type: "text_start", contentIndex, partial: output });
+							stream.push({ type: "text_delta", contentIndex, delta: block.text, partial: output });
+						}
 						stream.push({ type: "text_end", contentIndex, content: block.text, partial: output });
 					} else {
 						output.content.push({ type: "toolCall", id: block.id, name: block.name, arguments: {} });

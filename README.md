@@ -132,7 +132,7 @@ After reloading, open `/model`, choose provider `claude-code`, and select one of
 - `sonnet` — invoke Claude Code with `--model sonnet`
 - `opus` — invoke Claude Code with `--model opus`
 
-Pi's conversation, system prompt, tool definitions, and tool results are sent
+Pi's conversation, tool definitions, and tool results are sent
 to `claude -p` on stdin for every provider request. Each semantic Pi message is
 a separate stream-JSON text block, preserving an exact unchanged prefix as the
 history grows so Anthropic's automatic prompt cache can reuse it across fresh
@@ -160,11 +160,26 @@ prompt, suppressing the normal coding-agent instruction bundle; Claude Code's
 small SDK identity and subscription-billing markers remain on the wire. Fable
 also adds a short reporting-accuracy rule that Claude Code 2.1.260 provides no
 supported switch to remove. This integration requires a Claude Code release
-with `--safe-mode` and `--permission-prompts`; it is tested with 2.1.260.
+with `--safe-mode`, `--permission-prompts`, `--system-prompt-file`, and
+`--include-partial-messages`; the streaming path was smoke-tested with 2.1.318.
 The executable defaults to `claude`; set `CLAUDE_CODE_EXECUTABLE` when it is
 installed elsewhere. Requests default to five minutes and are capped at 30
 minutes, 4 MiB of serialized input, and 1 MiB each of stdout/stderr. Abort,
 timeout, or excessive output terminates the complete subprocess group.
+
+Pi's system instructions are combined with the adapter instructions and passed through
+`--system-prompt-file`, not embedded in the user message. The file lives in a private
+temporary directory, has mode `0600`, and is removed after success, error, or cancellation.
+Conversation history, tool definitions, and request options still travel as JSON text
+blocks on stdin; conversation roles remain serialized data.
+
+`--include-partial-messages` enables incremental display of leading text blocks from
+Claude's `StructuredOutput` arguments. Native commentary and native tool arguments are
+not displayed as answers. Tool calls, and text following a tool call, wait for the
+validated terminal result. Displayed text is provisional: a failed request or a final
+response that contradicts the preview produces a Pi error, never an executable tool
+call. CLI responses without partial events still use the buffered fallback. Upstream
+buffering can cause deltas to arrive in a burst.
 
 The provider is text-only because the Claude Code print interface does not
 accept Pi's in-memory image blocks. Binary image data is omitted from cross-

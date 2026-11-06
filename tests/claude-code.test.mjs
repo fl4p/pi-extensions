@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,6 +8,7 @@ import claudeCodeExtension, {
 	buildArgs,
 	CLAUDE_CODE_MODELS,
 	createClaudeCodeProvider,
+	createTextPreview,
 	encodeClaudeInput,
 	MAX_INPUT_BYTES,
 	MAX_OUTPUT_BYTES,
@@ -54,6 +55,8 @@ process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   fs.writeFileSync(${JSON.stringify(recordPath)}, JSON.stringify({
     argv: process.argv.slice(2),
+    systemPrompt: fs.readFileSync(process.argv[process.argv.indexOf("--system-prompt-file") + 1], "utf8"),
+    systemMode: fs.statSync(process.argv[process.argv.indexOf("--system-prompt-file") + 1]).mode & 0o777,
     cwd: process.cwd(),
     input,
     disableTerminalTitle: process.env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE,
@@ -112,6 +115,7 @@ test("default argv disables Claude tools and side effects without --bare", () =>
 	assert.equal(args[args.indexOf("--input-format") + 1], "stream-json");
 	assert.equal(args[args.indexOf("--output-format") + 1], "stream-json");
 	assert.ok(args.includes("--verbose"));
+	assert.ok(args.includes("--include-partial-messages"));
 	assert.equal(args[args.indexOf("--tools") + 1], "");
 	assert.equal(args[args.indexOf("--permission-prompts") + 1], "none");
 	assert.equal(args[args.indexOf("--permission-mode") + 1], "dontAsk");
@@ -411,5 +415,158 @@ test("Claude-reported failures and unavailable tool calls surface as Pi errors",
 		const events = await eventsOf(provider.streamSimple(provider.getModels()[0], textContext));
 		assert.equal(events.at(-1).type, "error");
 		assert.equal(events.at(-1).error.stopReason, "error");
+	}
+});
+
+function streamRecord(event, parent_tool_use_id = null) {
+	return { type: "stream_event", parent_tool_use_id, event };
+}
+function structuredStart() {
+	return streamRecord({ type: "content_block_start", index: 0, content_block: { type: "tool_use", name: "StructuredOutput" } });
+}
+function structuredDelta(partial_json) {
+	return streamRecord({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json } });
+}
+
+test("system instructions use a private temporary file and leave stdin; file is removed", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-claude-system-test-"));
+	const record = join(dir, "record.json");
+	const { path } = recordingClaude(record, envelope({ content: [{ type: "text", text: "ok" }] }));
+	const prompt = '$(touch NEVER) `id` --bare ' + "large prompt ".repeat(20000);
+	const provider = createClaudeCodeProvider({ executable: path, cwd: dir });
+	const result = await provider.streamSimple(provider.getModels()[0], textContext, {
+		onPayload(payload) { return { ...payload, systemPrompt: prompt }; },
+	}).result();
+	assert.equal(result.stopReason, "stop");
+	const seen = JSON.parse(readFileSync(record, "utf8"));
+	assert.ok(seen.systemPrompt.endsWith(prompt));
+	assert.equal(seen.systemMode, 0o600);
+	assert.ok(!seen.argv.some(arg => arg.includes(prompt)));
+	assert.ok(!seen.input.includes("large prompt"));
+	assert.ok(!seen.input.includes('systemPrompt'));
+	const promptPath = seen.argv[seen.argv.indexOf("--system-prompt-file") + 1];
+	assert.equal(existsSync(promptPath), false);
+	assert.equal(existsSync(join(dir, "NEVER")), false);
+});
+
+test("partial StructuredOutput decodes split escapes without leaking tools or native commentary", () => {
+	const snapshots = [];
+	const preview = createTextPreview((index, text) => snapshots.push({ index, text }));
+	preview(streamRecord({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "PRIVATE COMMENTARY" } }));
+	preview({ ...structuredStart(), parent_tool_use_id: "subagent" });
+	preview(structuredDelta('{"content":[{"type":"text","text":"ignored"}]}'));
+	assert.deepEqual(snapshots, []);
+	preview(structuredStart());
+	const content = [{type:"text", text:'line\nquote" slash\\ café 😀'}, {type:"toolCall", name:"read", argumentsJson:'{"path":"secret"}'}, {type:"text", text:"after tool"}];
+	const json = JSON.stringify({content}).replace('😀', '\\ud83d\\ude00');
+	for (const char of json) preview(structuredDelta(char));
+	assert.equal(snapshots.at(-1).text, content[0].text);
+	for (const snapshot of snapshots) {
+		assert.equal(snapshot.index, 0);
+		assert.ok(content[0].text.startsWith(snapshot.text));
+		assert.doesNotMatch(snapshot.text, /[\uD800-\uDBFF]$/);
+	}
+});
+
+// The child waits for the consumer to acknowledge an early delta. A provider that
+// buffers until exit deadlocks and times out, so this proves real early delivery.
+function gatedClaude(dir, response, exitCode = 0) {
+	const ack = join(dir, "ack");
+	const records = [structuredStart(), structuredDelta('{"content":[{"type":"text","text":"Hello café 😀')];
+	const prefix = records.map(record => JSON.stringify(record) + "\n").join("");
+	const tail = JSON.stringify(structuredDelta(' world"},{"type":"toolCall","name":"read","argumentsJson":"{}"}]}')) + "\n";
+	const {path} = fakeClaude(`
+const fs = require("node:fs");
+process.stdin.resume();
+process.stdin.on("end", () => {
+ const bytes = Buffer.from(${JSON.stringify(prefix)});
+ // Split in the middle of UTF-8 and NDJSON records.
+ const cut = bytes.indexOf(Buffer.from("é")) + 1;
+ process.stdout.write(bytes.subarray(0, cut));
+ setTimeout(() => process.stdout.write(bytes.subarray(cut)), 20);
+ const timer = setInterval(() => {
+  if (!fs.existsSync(${JSON.stringify(ack)})) return;
+  clearInterval(timer);
+  process.stdout.write(${JSON.stringify(tail)});
+  process.stdout.write(${JSON.stringify(JSON.stringify(response) + "\n")});
+  process.exitCode = ${exitCode};
+ }, 10);
+});`);
+	return {path, ack};
+}
+
+test("text streams before exit, UTF-8 survives chunks, and tools wait for terminal validation", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-claude-early-"));
+	const response = envelope({ content: [{type:"text", text:"Hello café 😀 world"}, {type:"toolCall", name:"read", argumentsJson:"{}"}, {type:"text", text:"After tool"}] });
+	const {path, ack} = gatedClaude(dir, response);
+	const provider = createClaudeCodeProvider({executable:path, cwd:dir});
+	const events = [];
+	for await (const event of provider.streamSimple(provider.getModels()[0], textContext, {timeoutMs:10000})) {
+		events.push(event);
+		if (event.type === "text_delta" && !existsSync(ack)) {
+			assert.equal(event.delta, "Hello café 😀");
+			assert.ok(!events.some(e => e.type.startsWith("toolcall")));
+			writeFileSync(ack, "ok");
+		}
+	}
+	assert.equal(events.at(-1).type, "done");
+	assert.equal(events.filter(e=>e.type === "text_delta").map(e=>e.delta).join(""), "Hello café 😀 worldAfter tool");
+	assert.deepEqual(events.at(-1).message.content.map(b=>b.type), ["text", "toolCall", "text"]);
+	assert.equal(events.filter(e=>e.type === "toolcall_end").length, 1);
+});
+
+for (const [label, response, exitCode] of [
+	["changed text", envelope({content:[{type:"text",text:"different"},{type:"toolCall",name:"read",argumentsJson:"{}"}]}), 0],
+	["unavailable tool", envelope({content:[{type:"text",text:"Hello café 😀 world"},{type:"toolCall",name:"forbidden",argumentsJson:"{}"}]}), 0],
+	["malformed arguments", envelope({content:[{type:"text",text:"Hello café 😀 world"},{type:"toolCall",name:"read",argumentsJson:"{"}]}), 0],
+	["missing terminal result", {type:"assistant",message:{content:[]}}, 0],
+	["nonzero exit", envelope({content:[{type:"text",text:"Hello café 😀 world"},{type:"toolCall",name:"read",argumentsJson:"{}"}]}), 1],
+]) {
+	test(`streaming fails closed on ${label}`, async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-claude-bad-stream-"));
+		const {path, ack} = gatedClaude(dir, response, exitCode);
+		const provider = createClaudeCodeProvider({executable:path, cwd:dir});
+		const events = [];
+		for await (const event of provider.streamSimple(provider.getModels()[0], textContext, {timeoutMs:10000})) {
+			events.push(event);
+			if(event.type === "text_delta") writeFileSync(ack, "ok");
+		}
+		assert.equal(events.at(-1).type, "error");
+		assert.ok(!events.some(e => e.type.startsWith("toolcall") || e.type === "done"));
+	});
+}
+
+for (const abort of [false, true]) {
+	test(`partial text followed by ${abort ? "abort" : "timeout"} emits no tools and cleans the prompt`, async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-claude-cancel-preview-"));
+		const record = join(dir, "prompt-path");
+		const lines = [structuredStart(), structuredDelta('{"content":[{"type":"text","text":"pending')].map(r=>JSON.stringify(r)+"\n").join("");
+		const {path} = fakeClaude(`
+const fs = require("node:fs");
+fs.writeFileSync(${JSON.stringify(record)}, process.argv[process.argv.indexOf("--system-prompt-file")+1]);
+process.stdin.resume();
+process.stdin.on("end", () => process.stdout.write(${JSON.stringify(lines)}));
+setInterval(()=>{},1000);
+`);
+		const controller = new AbortController();
+		const provider = createClaudeCodeProvider({executable:path,cwd:dir});
+		const events=[];
+		for await (const e of provider.streamSimple(provider.getModels()[0],textContext,{timeoutMs:abort?10000:1500,signal:controller.signal})) {
+			events.push(e);
+			if(abort && e.type === "text_delta") controller.abort();
+		}
+		assert.ok(events.some(e=>e.type === "text_delta"));
+		assert.equal(events.at(-1).type,"error");
+		assert.equal(events.at(-1).reason,abort?"aborted":"error");
+		assert.ok(!events.some(e=>e.type.startsWith("toolcall")));
+		assert.equal(existsSync(readFileSync(record,"utf8")),false);
+	});
+}
+
+test("invalid and oversized system prompts fail before spawning",async()=>{
+	for(const systemPrompt of [42,"x".repeat(MAX_INPUT_BYTES),"x".repeat(MAX_INPUT_BYTES*2)]) {
+		const result=await runClaudeCode({modelId:"default",payload:{protocol:"pi-context-v1",systemPrompt,messages:[]},allowedToolNames:new Set(),cwd:process.cwd(),timeoutMs:1000,executable:"/must-not-be-spawned"});
+		assert.equal(result.ok,false);
+		assert.equal(result.reason,"invalid-request");
 	}
 });
