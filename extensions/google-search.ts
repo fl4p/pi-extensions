@@ -7,7 +7,8 @@ import { join } from "node:path";
 
 const CONFIG_PATH = join(homedir(), ".pi", "web-search.json");
 const MAX_QUERIES = 4;
-const REQUEST_TIMEOUT_MS = 30_000;
+const SEARCH_TIMEOUT_MS = 30_000;
+const RESOLVE_TIMEOUT_MS = 45_000;
 
 function getApiKey(): string | null {
 	const env = process.env.SERPER_API_KEY;
@@ -23,20 +24,52 @@ function getApiKey(): string | null {
 	}
 }
 
-interface SerperResult {
+export interface SerperResult {
 	title: string;
 	link: string;
 	snippet?: string;
 	position?: number;
 }
 
-interface SerperResponse {
+export interface SerperResponse {
 	organic?: SerperResult[];
 	knowledgeGraph?: { title?: string; description?: string; website?: string };
 	answerBox?: { snippet?: string; title?: string };
 	news?: SerperResult[];
 	images?: SerperResult[];
 	searchParameters?: { q?: string; gl?: string; hl?: string };
+}
+
+export function isGoogleRedirectUrl(url: string | undefined): boolean {
+	if (!url) return false;
+	return url.includes("google.com/goto") || url.includes("google.com/url");
+}
+
+export function hasGoogleRedirects(data: SerperResponse): boolean {
+	if (data.organic?.some((r) => isGoogleRedirectUrl(r.link))) return true;
+	if (data.news?.some((r) => isGoogleRedirectUrl(r.link))) return true;
+	if (data.images?.some((r) => isGoogleRedirectUrl(r.link))) return true;
+	if (isGoogleRedirectUrl(data.knowledgeGraph?.website)) return true;
+	return false;
+}
+
+export async function resolveSerperResponse(
+	data: SerperResponse,
+	apiKey: string,
+	signal?: AbortSignal,
+): Promise<SerperResponse> {
+	const timeoutSignal = AbortSignal.timeout(RESOLVE_TIMEOUT_MS);
+	const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+	const res = await fetch("https://google.serper.dev/resolve", {
+		method: "POST",
+		headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
+		body: JSON.stringify(data),
+		signal: requestSignal,
+	});
+	if (!res.ok) {
+		return data;
+	}
+	return (await res.json()) as SerperResponse;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -64,6 +97,12 @@ export default function (pi: ExtensionAPI) {
 			),
 			gl: Type.Optional(Type.String({ description: "Country code, e.g. 'us', 'de' (default us)." })),
 			hl: Type.Optional(Type.String({ description: "Language code, e.g. 'en', 'de' (default en)." })),
+			resolve: Type.Optional(
+				Type.Boolean({
+					description:
+						"Resolve Google redirect links (google.com/goto) via Serper /resolve if present (default true).",
+				}),
+			),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate) {
 			const apiKey = getApiKey();
@@ -118,7 +157,7 @@ export default function (pi: ExtensionAPI) {
 				});
 
 				try {
-					const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+					const timeoutSignal = AbortSignal.timeout(SEARCH_TIMEOUT_MS);
 					const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 					const res = await fetch("https://google.serper.dev/search", {
 						method: "POST",
@@ -142,7 +181,22 @@ export default function (pi: ExtensionAPI) {
 						continue;
 					}
 
-					const data = (await res.json()) as SerperResponse;
+					let data = (await res.json()) as SerperResponse;
+					const shouldResolve = params.resolve !== false;
+					if (shouldResolve && hasGoogleRedirects(data)) {
+						onUpdate?.({
+							content: [{ type: "text", text: `Resolving redirect URLs for "${q}" (~30s)...` }],
+							details: { phase: "resolving", currentQuery: q },
+						});
+						try {
+							data = await resolveSerperResponse(data, apiKey, signal);
+						} catch (resolveErr) {
+							if (signal?.aborted) {
+								throw signal.reason instanceof Error ? signal.reason : new Error("Search cancelled");
+							}
+							// Keep original data on resolve timeout / network error
+						}
+					}
 					const organic = data.organic ?? [];
 					allResults.push({ query: q, results: organic });
 					totalResults += organic.length;

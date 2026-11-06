@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import googleSearchExtension from "../extensions/google-search.ts";
+import googleSearchExtension, { hasGoogleRedirects, isGoogleRedirectUrl } from "../extensions/google-search.ts";
 
 function createTool() {
 	let tool;
@@ -105,6 +105,119 @@ test("google_search propagates caller cancellation and stops subsequent queries"
 			/cancelled by caller/,
 		);
 		assert.equal(calls, 1);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("hasGoogleRedirects detects redirect urls across sections", () => {
+	assert.equal(isGoogleRedirectUrl("https://example.com"), false);
+	assert.equal(isGoogleRedirectUrl("https://www.google.com/goto?url=CAES..."), true);
+	assert.equal(isGoogleRedirectUrl("https://www.google.com/url?q=https://example.com"), true);
+
+	assert.equal(hasGoogleRedirects({ organic: [{ title: "T", link: "https://example.com" }] }), false);
+	assert.equal(
+		hasGoogleRedirects({ organic: [{ title: "T", link: "https://www.google.com/goto?url=xyz" }] }),
+		true,
+	);
+	assert.equal(
+		hasGoogleRedirects({ news: [{ title: "N", link: "https://www.google.com/goto?url=xyz" }] }),
+		true,
+	);
+	assert.equal(
+		hasGoogleRedirects({ images: [{ title: "I", link: "https://www.google.com/goto?url=xyz" }] }),
+		true,
+	);
+	assert.equal(
+		hasGoogleRedirects({ knowledgeGraph: { website: "https://www.google.com/goto?url=xyz" } }),
+		true,
+	);
+});
+
+test("google_search resolves google.com/goto links when present", async () => {
+	const tool = createTool();
+	const originalFetch = globalThis.fetch;
+	const calledUrls = [];
+	globalThis.fetch = async (url, opts) => {
+		calledUrls.push(url);
+		if (url === "https://google.serper.dev/search") {
+			return {
+				ok: true,
+				status: 200,
+				json: async () => ({
+					organic: [
+						{ title: "Direct", link: "https://example.com" },
+						{ title: "Redirected", link: "https://www.google.com/goto?url=CAES" },
+					],
+				}),
+			};
+		}
+		if (url === "https://google.serper.dev/resolve") {
+			return {
+				ok: true,
+				status: 200,
+				json: async () => ({
+					organic: [
+						{ title: "Direct", link: "https://example.com" },
+						{ title: "Redirected", link: "https://resolved.example.com" },
+					],
+				}),
+			};
+		}
+		throw new Error(`Unexpected url: ${url}`);
+	};
+	process.env.SERPER_API_KEY = "test";
+	try {
+		const result = await tool.execute("resolve-test", { query: "test query" });
+		assert.deepEqual(calledUrls, ["https://google.serper.dev/search", "https://google.serper.dev/resolve"]);
+		assert.match(result.content[0].text, /https:\/\/resolved\.example\.com/);
+		assert.doesNotMatch(result.content[0].text, /google\.com\/goto/);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("google_search skips /resolve when no redirect urls or resolve: false", async () => {
+	const tool = createTool();
+	const originalFetch = globalThis.fetch;
+	let calledUrls = [];
+	globalThis.fetch = async (url) => {
+		calledUrls.push(url);
+		return {
+			ok: true,
+			status: 200,
+			json: async () => ({
+				organic: [
+					{ title: "Direct 1", link: "https://example.com/1" },
+					{ title: "Direct 2", link: "https://example.com/2" },
+				],
+			}),
+		};
+	};
+	process.env.SERPER_API_KEY = "test";
+	try {
+		// Case 1: All direct links
+		await tool.execute("skip-test-1", { query: "direct only" });
+		assert.deepEqual(calledUrls, ["https://google.serper.dev/search"]);
+
+		// Case 2: Redirect links present but resolve: false
+		calledUrls = [];
+		globalThis.fetch = async (url) => {
+			calledUrls.push(url);
+			return {
+				ok: true,
+				status: 200,
+				json: async () => ({
+					organic: [
+						{ title: "Direct", link: "https://example.com" },
+						{ title: "Redirect", link: "https://www.google.com/goto?url=CAES" },
+					],
+				}),
+			};
+		};
+		const result = await tool.execute("skip-test-2", { query: "opt out", resolve: false });
+		assert.deepEqual(calledUrls, ["https://google.serper.dev/search"]);
+		assert.match(result.content[0].text, /google\.com\/goto/);
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
